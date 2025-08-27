@@ -150,6 +150,18 @@ class DataFrame:
         """Get the number of rows in the DataFrame."""
         return self._length
     
+    def with_name(self, name: str) -> 'DataFrame':
+        """
+        Create a new DataFrame with the specified name.
+        
+        Args:
+            name: The new name for the DataFrame
+            
+        Returns:
+            New DataFrame with the same data but different name
+        """
+        return DataFrame(self._data, name=name)
+    
     def __getitem__(self, key: str) -> Union[List[Any], np.ndarray, Any]:
         """
         Get a column by name.
@@ -951,15 +963,8 @@ class DataFrame:
                 for col in self._columns:
                     new_data[col].append(other[col][other_row_idx])
         
-        # Determine new name
-        if self._name and other._name:
-            new_name = f"{self._name}_updated_with_{other._name}"
-        elif self._name:
-            new_name = f"{self._name}_updated"
-        elif other._name:
-            new_name = f"updated_with_{other._name}"
-        else:
-            new_name = "updated_lookup"
+        # Determine new name - inherit from original DataFrame
+        new_name = self._name
         
         return DataFrame(new_data, name=new_name)
     
