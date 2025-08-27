@@ -54,14 +54,23 @@ class DataFrame:
                 # Check if it's a JAX array
                 try:
                     import jax.numpy as jnp
-                    # Check if it's a JAX array by checking for JAX-specific attributes
-                    if hasattr(values, 'shape') and hasattr(values, 'dtype') and hasattr(values, '__array__'):
-                        # Check if it's actually a JAX array (not just array-like)
-                        if hasattr(values, 'device') or str(type(values)).startswith('<class \'jaxlib.'):
-                            # This is a JAX array - preserve it as-is
+                    import jax
+                    # Check if it's a JAX array or tracer by checking for JAX-specific attributes
+                    if hasattr(values, 'shape') and hasattr(values, 'dtype'):
+                        # Check if it's actually a JAX array/tracer
+                        if (hasattr(values, 'device') or 
+                            str(type(values)).startswith('<class \'jaxlib.') or
+                            isinstance(values, (jax.Array, jax.core.Tracer)) or
+                            str(type(values).__module__).startswith('jax')):
+                            # This is a JAX array or tracer - preserve it as-is
                             self._data[column_name] = values
                             self._column_types[column_name] = 'jax_array'
-                            lengths.append(len(values))
+                            # For tracers, we need to use shape[0] instead of len()
+                            if hasattr(values, 'shape') and values.shape:
+                                lengths.append(values.shape[0])
+                            else:
+                                # Fallback for edge cases
+                                lengths.append(1)
                         else:
                             # This is some other array-like object, convert to numpy
                             # Use np.asarray to avoid copy warnings in numpy 2.0+

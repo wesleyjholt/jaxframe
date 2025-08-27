@@ -377,13 +377,13 @@ def jax_arrays_to_wide_df(
         value_col_name = f"{var_prefix}${var_idx}$value"
         mask_col_name = f"{var_prefix}${var_idx}$mask"
         
-        # Extract column data and convert to Python lists/arrays
+        # Extract column data as JAX arrays to preserve computational graph
         values_col = values_array[:, var_idx]
         masks_col = mask_array[:, var_idx]
         
-        # Convert JAX arrays to regular arrays/lists for DataFrame
-        wide_data[value_col_name] = [float(x) for x in values_col]
-        wide_data[mask_col_name] = [bool(x) for x in masks_col]
+        # Keep as JAX arrays to preserve computational graph
+        wide_data[value_col_name] = values_col
+        wide_data[mask_col_name] = masks_col
     
     return DataFrame(wide_data)
 

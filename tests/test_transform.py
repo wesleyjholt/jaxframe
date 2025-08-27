@@ -421,12 +421,18 @@ def test_jax_arrays_to_wide_df():
     # Check values
     wide_dict = wide_df.to_dict()
     assert wide_dict['sample_id'] == ['A', 'B', 'C']
-    assert wide_dict['var$0$value'] == [1.0, 4.0, 7.0]
-    assert wide_dict['var$1$value'] == [2.0, 5.0, 8.0]
-    assert wide_dict['var$2$value'] == [3.0, 6.0, 9.0]
-    assert wide_dict['var$0$mask'] == [True, True, False]
-    assert wide_dict['var$1$mask'] == [True, False, True]
-    assert wide_dict['var$2$mask'] == [False, True, True]
+    
+    # Check JAX array values using jnp.array_equal
+    assert jnp.array_equal(wide_dict['var$0$value'], jnp.array([1.0, 4.0, 7.0]))
+    assert jnp.array_equal(wide_dict['var$1$value'], jnp.array([2.0, 5.0, 8.0]))
+    assert jnp.array_equal(wide_dict['var$2$value'], jnp.array([3.0, 6.0, 9.0]))
+    assert jnp.array_equal(wide_dict['var$0$mask'], jnp.array([True, True, False]))
+    assert jnp.array_equal(wide_dict['var$1$mask'], jnp.array([True, False, True]))
+    assert jnp.array_equal(wide_dict['var$2$mask'], jnp.array([False, True, True]))
+    
+    # Check that the columns are indeed JAX arrays
+    assert wide_df.column_types['var$0$value'] == 'jax_array'
+    assert wide_df.column_types['var$0$mask'] == 'jax_array'
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")
@@ -462,12 +468,22 @@ def test_roundtrip_wide_jax_conversion():
     recon_dict = reconstructed_df.to_dict()
     
     for col in original_df.columns:
-        if 'value' in col:
-            # Check floating point values with tolerance
-            for i in range(len(orig_dict[col])):
-                assert abs(orig_dict[col][i] - recon_dict[col][i]) < 1e-10
+        if 'value' in col or 'mask' in col:
+            # For value and mask columns, compare using JAX array equality
+            if isinstance(recon_dict[col], jnp.ndarray):
+                # Reconstructed column is JAX array, convert original for comparison
+                expected = jnp.array(orig_dict[col])
+                assert jnp.array_equal(expected, recon_dict[col])
+            else:
+                # Both should be lists/arrays - compare element by element
+                assert len(orig_dict[col]) == len(recon_dict[col])
+                for i in range(len(orig_dict[col])):
+                    if 'value' in col:
+                        assert abs(orig_dict[col][i] - recon_dict[col][i]) < 1e-10
+                    else:
+                        assert orig_dict[col][i] == recon_dict[col][i]
         else:
-            # Check exact equality for other columns
+            # Check exact equality for ID columns
             assert orig_dict[col] == recon_dict[col]
 
 
@@ -495,3 +511,90 @@ def test_wide_df_to_jax_arrays_missing_masks():
         [False, True]   # B: var$0 has mask=False, var$1 defaults to True  
     ])
     assert jnp.array_equal(masks, expected_masks)
+
+
+@pytest.mark.skipif(not jax_available, reason="JAX not available")
+def test_jax_computational_graph_preservation():
+    """Test that JAX computational graph is preserved through conversion."""
+    import jax.numpy as jnp
+    from jax import grad
+    
+    # Create a function that uses the DataFrame conversion
+    def compute_loss(params):
+        # Create wide DataFrame with JAX arrays that depend on params
+        wide_data = {
+            'sample_id': ['A', 'B'],
+            'var$0$value': params * jnp.array([1.0, 2.0]),
+            'var$0$mask': jnp.array([True, True]),
+            'var$1$value': params * jnp.array([3.0, 4.0]),
+            'var$1$mask': jnp.array([True, True])
+        }
+        df = DataFrame(wide_data)
+        
+        # Convert to JAX arrays
+        values, masks, id_df = wide_df_to_jax_arrays(df, ['sample_id'])
+        
+        # Convert back to wide DataFrame
+        reconstructed_df = jax_arrays_to_wide_df(values, masks, id_df, 'var')
+        
+        # Get values and compute a loss
+        val0 = reconstructed_df['var$0$value']
+        val1 = reconstructed_df['var$1$value']
+        
+        # Compute sum of squares loss
+        loss = jnp.sum(val0**2) + jnp.sum(val1**2)
+        return loss
+    
+    # Test that we can compute gradients (meaning computational graph is preserved)
+    params = 2.0
+    loss_fn = compute_loss
+    grad_fn = grad(loss_fn)
+    
+    # This should work if the computational graph is preserved
+    gradient = grad_fn(params)
+    
+    # Verify the gradient is correct
+    # loss = sum((params * [1,2])^2) + sum((params * [3,4])^2)
+    #      = params^2 * (1 + 4 + 9 + 16) = params^2 * 30
+    # dloss/dparams = 2 * params * 30 = 60 * params
+    expected_gradient = 60.0 * params
+    assert abs(gradient - expected_gradient) < 1e-6
+    
+    print(f"✓ JAX computational graph preserved! Gradient: {gradient}")
+
+
+@pytest.mark.skipif(not jax_available, reason="JAX not available")
+def test_jax_arrays_remain_jax_arrays():
+    """Test that JAX arrays in reconstructed DataFrame are still JAX arrays."""
+    import jax.numpy as jnp
+    
+    # Create input arrays
+    values = jnp.array([[1.0, 2.0], [3.0, 4.0]])
+    masks = jnp.array([[True, True], [False, True]])
+    id_df = DataFrame({'sample_id': ['A', 'B']})
+    
+    # Convert to DataFrame
+    wide_df = jax_arrays_to_wide_df(values, masks, id_df, 'test')
+    
+    # Check that the values are JAX arrays, not lists
+    val0 = wide_df['test$0$value']
+    val1 = wide_df['test$1$value']
+    mask0 = wide_df['test$0$mask']
+    mask1 = wide_df['test$1$mask']
+    
+    assert isinstance(val0, jnp.ndarray), f"Expected JAX array, got {type(val0)}"
+    assert isinstance(val1, jnp.ndarray), f"Expected JAX array, got {type(val1)}"
+    assert isinstance(mask0, jnp.ndarray), f"Expected JAX array, got {type(mask0)}"
+    assert isinstance(mask1, jnp.ndarray), f"Expected JAX array, got {type(mask1)}"
+    
+    # Check that DataFrame recognizes them as JAX arrays
+    assert wide_df.column_types['test$0$value'] == 'jax_array'
+    assert wide_df.column_types['test$1$value'] == 'jax_array'
+    assert wide_df.column_types['test$0$mask'] == 'jax_array'
+    assert wide_df.column_types['test$1$mask'] == 'jax_array'
+    
+    # Test that we can do JAX operations on them
+    sum_val0 = jnp.sum(val0)
+    assert abs(sum_val0 - 4.0) < 1e-6
+    
+    print("✓ JAX arrays preserved as JAX arrays in DataFrame!")
