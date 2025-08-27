@@ -7,6 +7,7 @@ including wide-to-long format conversions with mask support.
 
 from typing import List, Tuple, Any, Union, Optional
 import re
+import numpy as np
 from .dataframe import DataFrame
 
 
@@ -313,7 +314,7 @@ def wide_df_to_jax_arrays(
     n_vars = len(value_columns)
     
     values = jnp.zeros((n_rows, n_vars))
-    masks = jnp.ones((n_rows, n_vars), dtype=bool)  # Default to True (unmasked)
+    masks = np.ones((n_rows, n_vars), dtype=bool)  # Use numpy for masks to avoid traced boolean errors
     
     for i, (value_col, mask_col) in enumerate(zip(value_columns, mask_columns)):
         # Get values
@@ -327,7 +328,7 @@ def wide_df_to_jax_arrays(
             col_masks = df[mask_col]
             if hasattr(col_masks, 'copy'):
                 col_masks = col_masks.copy()
-            masks = masks.at[:, i].set(jnp.array(col_masks))
+            masks[:, i] = np.array(col_masks)  # Use numpy assignment for masks
     
     # Create ID DataFrame
     id_data = {col: df[col] for col in id_columns}
