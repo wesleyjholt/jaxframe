@@ -2,7 +2,8 @@
 
 A simple, jax-compatible DataFrame library. 
 
-`jaxframe` provides a convenient way to differentiate functions that perform (simple) relational database-like operations (add, join, etc.).
+`jaxframe` provides a convenient way to differentiate functions that perform (simple) relational database-like operations (add, join, etc.). 
+All data frames are immutable and all data transformations are implemented as pure functions.
 
 ## Installation
 
