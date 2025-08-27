@@ -1,0 +1,87 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jaxframe"
+dynamic = ["version"]
+description = ''
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+keywords = []
+authors = [
+  { name = "Wesley Holt", email = "wesleyjholt@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3.8",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: Implementation :: PyPy",
+]
+dependencies = [
+  "jax",
+  "numpy"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=6.0",
+]
+examples = [
+  "pandas",
+  "seaborn"
+]
+
+[project.urls]
+Documentation = "https://github.com/Wesley Holt/jaxframe#readme"
+Issues = "https://github.com/Wesley Holt/jaxframe/issues"
+Source = "https://github.com/Wesley Holt/jaxframe"
+
+[tool.hatch.version]
+path = "src/jaxframe/__about__.py"
+
+[tool.hatch.envs.types]
+extra-dependencies = [
+  "mypy>=1.0.0",
+]
+[tool.hatch.envs.types.scripts]
+check = "mypy --install-types --non-interactive {args:src/jaxframe tests}"
+
+[tool.coverage.run]
+source_pkgs = ["jaxframe", "tests"]
+branch = true
+parallel = true
+omit = [
+  "src/jaxframe/__about__.py",
+]
+
+[tool.coverage.paths]
+jaxframe = ["src/jaxframe", "*/jaxframe/src/jaxframe"]
+tests = ["tests", "*/jaxframe/tests"]
+
+[tool.coverage.report]
+exclude_lines = [
+  "no cov",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "-v",
+    "--tb=short",
+    "--strict-markers",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
