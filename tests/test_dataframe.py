@@ -544,3 +544,195 @@ def test_add_remove_operations_chaining():
     # Original DataFrame should be unchanged
     assert df.shape == (2, 2)
     assert df.columns == ('name', 'age')
+
+
+def test_concat_rows_same_columns():
+    """Test concatenating DataFrames with same columns (vertical)."""
+    # Create two DataFrames with identical columns
+    df1 = DataFrame({
+        'name': ['Alice', 'Bob'],
+        'age': [25, 30],
+        'score': np.array([85.5, 92.0])
+    }, name="df1")
+    
+    df2 = DataFrame({
+        'name': ['Charlie', 'Diana'],
+        'age': [35, 28],
+        'score': np.array([78.5, 95.0])
+    }, name="df2")
+    
+    # Concatenate vertically
+    result = df1.concat(df2, axis=0)
+    
+    # Check result
+    assert result.shape == (4, 3)
+    assert result.columns == ('name', 'age', 'score')
+    assert result['name'] == ['Alice', 'Bob', 'Charlie', 'Diana']
+    assert result['age'] == [25, 30, 35, 28]
+    assert np.array_equal(result['score'], [85.5, 92.0, 78.5, 95.0])
+    
+    # Check name
+    assert result.name == "df1_concat_df2"
+    
+    # Check that column types are preserved/promoted correctly
+    assert result.column_types['name'] == 'list'
+    assert result.column_types['age'] == 'list'
+    assert result.column_types['score'] == 'array'
+    
+    # Original DataFrames should be unchanged
+    assert df1.shape == (2, 3)
+    assert df2.shape == (2, 3)
+
+
+def test_concat_rows_different_columns():
+    """Test concatenating DataFrames with different columns."""
+    df1 = DataFrame({
+        'name': ['Alice', 'Bob'],
+        'age': [25, 30]
+    })
+    
+    df2 = DataFrame({
+        'name': ['Charlie', 'Diana'],
+        'salary': [50000, 60000]
+    })
+    
+    # Should fail without ignore_index
+    with pytest.raises(ValueError, match="DataFrames must have the same columns"):
+        df1.concat(df2, axis=0)
+    
+    # Should work with ignore_index=True (only common columns)
+    result = df1.concat(df2, axis=0, ignore_index=True)
+    assert result.shape == (4, 1)  # Only 'name' column is common
+    assert result.columns == ('name',)
+    assert result['name'] == ['Alice', 'Bob', 'Charlie', 'Diana']
+
+
+def test_concat_columns_horizontal():
+    """Test concatenating DataFrames horizontally."""
+    df1 = DataFrame({
+        'name': ['Alice', 'Bob', 'Charlie'],
+        'age': [25, 30, 35]
+    }, name="personal")
+    
+    df2 = DataFrame({
+        'salary': np.array([50000, 60000, 55000]),
+        'department': ['Engineering', 'Marketing', 'Sales']
+    }, name="work")
+    
+    # Concatenate horizontally
+    result = df1.concat(df2, axis=1)
+    
+    # Check result
+    assert result.shape == (3, 4)
+    assert set(result.columns) == {'name', 'age', 'salary', 'department'}
+    assert result['name'] == ['Alice', 'Bob', 'Charlie']
+    assert result['age'] == [25, 30, 35]
+    assert np.array_equal(result['salary'], [50000, 60000, 55000])
+    assert result['department'] == ['Engineering', 'Marketing', 'Sales']
+    
+    # Check name
+    assert result.name == "personal_hconcat_work"
+    
+    # Check that column types are preserved
+    assert result.column_types['name'] == 'list'
+    assert result.column_types['age'] == 'list'
+    assert result.column_types['salary'] == 'array'
+    assert result.column_types['department'] == 'list'
+
+
+def test_concat_columns_errors():
+    """Test error conditions for horizontal concatenation."""
+    df1 = DataFrame({
+        'name': ['Alice', 'Bob'],
+        'age': [25, 30]
+    })
+    
+    df2 = DataFrame({
+        'name': ['Charlie'],  # Different number of rows
+        'salary': [50000]
+    })
+    
+    df3 = DataFrame({
+        'age': [35, 40],  # Overlapping column name
+        'salary': [50000, 60000]
+    })
+    
+    # Different number of rows
+    with pytest.raises(ValueError, match="DataFrames must have the same number of rows"):
+        df1.concat(df2, axis=1)
+    
+    # Overlapping column names
+    with pytest.raises(ValueError, match="DataFrames have overlapping column names"):
+        df1.concat(df3, axis=1)
+
+
+def test_concat_mixed_types():
+    """Test concatenating DataFrames with mixed column types."""
+    df1 = DataFrame({
+        'names': ['Alice', 'Bob'],           # list
+        'ages': [25, 30],                    # list  
+        'scores': np.array([85.5, 92.0])     # numpy array
+    })
+    
+    df2 = DataFrame({
+        'names': np.array(['Charlie', 'Diana']),  # numpy array
+        'ages': np.array([35, 28]),               # numpy array
+        'scores': [78.5, 95.0]                    # list
+    })
+    
+    # Concatenate - types should be promoted appropriately
+    result = df1.concat(df2, axis=0)
+    
+    assert result.shape == (4, 3)
+    # For arrays, we need to convert to list for comparison or use np.array_equal
+    assert list(result['names']) == ['Alice', 'Bob', 'Charlie', 'Diana']
+    assert list(result['ages']) == [25, 30, 35, 28]
+    assert list(result['scores']) == [85.5, 92.0, 78.5, 95.0]
+    
+    # Check type promotion: list + array = array
+    assert result.column_types['names'] == 'array'  # list + array = array
+    assert result.column_types['ages'] == 'array'   # list + array = array  
+    assert result.column_types['scores'] == 'array' # array + list = array
+
+
+def test_concat_static_method():
+    """Test the static concat_dataframes method."""
+    df1 = DataFrame({'a': [1, 2], 'b': [3, 4]}, name="first")
+    df2 = DataFrame({'a': [5, 6], 'b': [7, 8]}, name="second")
+    df3 = DataFrame({'a': [9, 10], 'b': [11, 12]}, name="third")
+    
+    # Concatenate multiple DataFrames
+    result = DataFrame.concat_dataframes([df1, df2, df3], axis=0)
+    
+    assert result.shape == (6, 2)
+    assert result['a'] == [1, 2, 5, 6, 9, 10]
+    assert result['b'] == [3, 4, 7, 8, 11, 12]
+    
+    # Test with single DataFrame
+    single_result = DataFrame.concat_dataframes([df1])
+    assert single_result.shape == df1.shape
+    assert single_result == df1
+    
+    # Test error conditions
+    with pytest.raises(ValueError, match="Cannot concatenate empty list"):
+        DataFrame.concat_dataframes([])
+    
+    with pytest.raises(TypeError, match="Element at index 1 is not a DataFrame"):
+        DataFrame.concat_dataframes([df1, "not a dataframe"])
+
+
+def test_concat_invalid_axis():
+    """Test concatenation with invalid axis parameter."""
+    df1 = DataFrame({'a': [1, 2]})
+    df2 = DataFrame({'a': [3, 4]})
+    
+    with pytest.raises(ValueError, match="axis must be 0 \\(rows\\) or 1 \\(columns\\)"):
+        df1.concat(df2, axis=2)
+
+
+def test_concat_non_dataframe():
+    """Test concatenation with non-DataFrame object."""
+    df1 = DataFrame({'a': [1, 2]})
+    
+    with pytest.raises(TypeError, match="Can only concatenate with another DataFrame"):
+        df1.concat("not a dataframe")

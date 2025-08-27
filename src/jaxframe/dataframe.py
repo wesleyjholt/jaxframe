@@ -612,3 +612,192 @@ class DataFrame:
                     ])
         
         return DataFrame(new_data, name=self._name)
+    
+    def concat(self, other: 'DataFrame', axis: int = 0, ignore_index: bool = False) -> 'DataFrame':
+        """
+        Concatenate this DataFrame with another DataFrame.
+        
+        Args:
+            other: DataFrame to concatenate with
+            axis: Axis along which to concatenate. 0 for rows (vertical), 1 for columns (horizontal)
+            ignore_index: If True, don't check for matching columns when axis=0
+                         If False, require same columns for row concatenation
+                         
+        Returns:
+            New DataFrame with concatenated data
+            
+        Raises:
+            ValueError: If DataFrames are incompatible for concatenation
+            TypeError: If other is not a DataFrame
+        """
+        if not isinstance(other, DataFrame):
+            raise TypeError("Can only concatenate with another DataFrame")
+        
+        if axis == 0:
+            # Row-wise concatenation (vertical stacking)
+            return self._concat_rows(other, ignore_index)
+        elif axis == 1:
+            # Column-wise concatenation (horizontal stacking)
+            return self._concat_columns(other)
+        else:
+            raise ValueError("axis must be 0 (rows) or 1 (columns)")
+    
+    def _concat_rows(self, other: 'DataFrame', ignore_index: bool = False) -> 'DataFrame':
+        """Concatenate DataFrames row-wise (vertically)."""
+        if not ignore_index:
+            # Check that both DataFrames have the same columns
+            if set(self._columns) != set(other._columns):
+                raise ValueError(
+                    f"DataFrames must have the same columns for row concatenation. "
+                    f"Self: {set(self._columns)}, Other: {set(other._columns)}"
+                )
+        else:
+            # Use intersection of columns
+            common_columns = set(self._columns) & set(other._columns)
+            if not common_columns:
+                raise ValueError("No common columns found between DataFrames")
+        
+        new_data = {}
+        columns_to_use = self._columns if not ignore_index else tuple(common_columns)
+        
+        for col in columns_to_use:
+            if col not in other._columns:
+                continue
+                
+            self_type = self._column_types[col]
+            other_type = other._column_types[col]
+            
+            self_values = self._data[col]
+            other_values = other._data[col]
+            
+            # Handle concatenation based on column types
+            if self_type == 'list' and other_type == 'list':
+                # Both lists: simple concatenation
+                new_data[col] = self_values + other_values
+            elif self_type == 'list' and other_type == 'array':
+                # List + array: convert list to array and concatenate
+                self_array = np.asarray(self_values)
+                new_data[col] = np.concatenate([self_array, other_values])
+            elif self_type == 'array' and other_type == 'list':
+                # Array + list: convert list to array and concatenate
+                other_array = np.asarray(other_values)
+                new_data[col] = np.concatenate([self_values, other_array])
+            elif self_type == 'array' and other_type == 'array':
+                # Both arrays: numpy concatenation
+                new_data[col] = np.concatenate([self_values, other_values])
+            elif self_type == 'jax_array' or other_type == 'jax_array':
+                # Handle JAX arrays
+                try:
+                    import jax.numpy as jnp
+                    # Convert both to JAX arrays if needed
+                    if self_type != 'jax_array':
+                        self_jax = jnp.asarray(self_values)
+                    else:
+                        self_jax = self_values
+                    
+                    if other_type != 'jax_array':
+                        other_jax = jnp.asarray(other_values)
+                    else:
+                        other_jax = other_values
+                    
+                    new_data[col] = jnp.concatenate([self_jax, other_jax])
+                except ImportError:
+                    # JAX not available, fall back to numpy
+                    self_array = np.asarray(self_values)
+                    other_array = np.asarray(other_values)
+                    new_data[col] = np.concatenate([self_array, other_array])
+        
+        # Create new name
+        new_name = None
+        if self._name and other._name:
+            new_name = f"{self._name}_concat_{other._name}"
+        elif self._name:
+            new_name = f"{self._name}_concat"
+        elif other._name:
+            new_name = f"concat_{other._name}"
+        
+        return DataFrame(new_data, name=new_name)
+    
+    def _concat_columns(self, other: 'DataFrame') -> 'DataFrame':
+        """Concatenate DataFrames column-wise (horizontally)."""
+        # Check that both DataFrames have the same number of rows
+        if self._length != other._length:
+            raise ValueError(
+                f"DataFrames must have the same number of rows for column concatenation. "
+                f"Self: {self._length} rows, Other: {other._length} rows"
+            )
+        
+        # Check for column name conflicts
+        common_columns = set(self._columns) & set(other._columns)
+        if common_columns:
+            raise ValueError(
+                f"DataFrames have overlapping column names: {common_columns}. "
+                f"Column names must be unique for horizontal concatenation."
+            )
+        
+        new_data = {}
+        
+        # Copy all columns from self
+        for col in self._columns:
+            if self._column_types[col] == 'list':
+                new_data[col] = self._data[col].copy()
+            elif self._column_types[col] == 'jax_array':
+                new_data[col] = self._data[col]
+            else:  # numpy array
+                new_data[col] = self._data[col].copy()
+        
+        # Copy all columns from other
+        for col in other._columns:
+            if other._column_types[col] == 'list':
+                new_data[col] = other._data[col].copy()
+            elif other._column_types[col] == 'jax_array':
+                new_data[col] = other._data[col]
+            else:  # numpy array
+                new_data[col] = other._data[col].copy()
+        
+        # Create new name
+        new_name = None
+        if self._name and other._name:
+            new_name = f"{self._name}_hconcat_{other._name}"
+        elif self._name:
+            new_name = f"{self._name}_hconcat"
+        elif other._name:
+            new_name = f"hconcat_{other._name}"
+        
+        return DataFrame(new_data, name=new_name)
+    
+    @staticmethod
+    def concat_dataframes(dataframes: List['DataFrame'], axis: int = 0, ignore_index: bool = False) -> 'DataFrame':
+        """
+        Concatenate multiple DataFrames.
+        
+        Args:
+            dataframes: List of DataFrames to concatenate
+            axis: Axis along which to concatenate. 0 for rows (vertical), 1 for columns (horizontal)
+            ignore_index: If True, don't check for matching columns when axis=0
+                         
+        Returns:
+            New DataFrame with concatenated data
+            
+        Raises:
+            ValueError: If DataFrames are incompatible for concatenation or list is empty
+            TypeError: If any element is not a DataFrame
+        """
+        if not dataframes:
+            raise ValueError("Cannot concatenate empty list of DataFrames")
+        
+        if len(dataframes) == 1:
+            # Return a copy if only one DataFrame
+            return DataFrame(dataframes[0].to_dict(), name=dataframes[0].name)
+        
+        # Validate all elements are DataFrames
+        for i, df in enumerate(dataframes):
+            if not isinstance(df, DataFrame):
+                raise TypeError(f"Element at index {i} is not a DataFrame")
+        
+        # Start with the first DataFrame and concatenate the rest
+        result = dataframes[0]
+        for df in dataframes[1:]:
+            result = result.concat(df, axis=axis, ignore_index=ignore_index)
+        
+        return result

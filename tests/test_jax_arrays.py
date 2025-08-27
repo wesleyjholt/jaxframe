@@ -334,3 +334,125 @@ def test_jax_edge_cases_add_remove():
     # Can't remove the last row
     with pytest.raises(ValueError, match="Cannot remove the last row"):
         single_df.remove_row(0)
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
+def test_concat_jax_arrays():
+    """Test concatenating DataFrames with JAX arrays."""
+    import jax.numpy as jnp
+    
+    # Create DataFrames with JAX arrays
+    df1 = DataFrame({
+        'names': ['Alice', 'Bob'],
+        'values': jnp.array([1.0, 2.0]),
+        'flags': jnp.array([True, False])
+    }, name="jax1")
+    
+    df2 = DataFrame({
+        'names': ['Charlie', 'Diana'],
+        'values': jnp.array([3.0, 4.0]),
+        'flags': jnp.array([True, True])
+    }, name="jax2")
+    
+    # Test row concatenation with JAX arrays
+    result = df1.concat(df2, axis=0)
+    
+    assert result.shape == (4, 3)
+    assert result['names'] == ['Alice', 'Bob', 'Charlie', 'Diana']
+    assert jnp.array_equal(result['values'], jnp.array([1.0, 2.0, 3.0, 4.0]))
+    assert jnp.array_equal(result['flags'], jnp.array([True, False, True, True]))
+    
+    # Check that JAX array types are preserved
+    assert result.column_types['values'] == 'jax_array'
+    assert result.column_types['flags'] == 'jax_array'
+    assert result.name == "jax1_concat_jax2"
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
+def test_concat_mixed_jax_numpy():
+    """Test concatenating DataFrames with mixed JAX and numpy arrays."""
+    import jax.numpy as jnp
+    
+    # JAX DataFrame
+    df_jax = DataFrame({
+        'values': jnp.array([1.0, 2.0]),
+        'names': ['A', 'B']
+    })
+    
+    # NumPy DataFrame  
+    df_numpy = DataFrame({
+        'values': np.array([3.0, 4.0]),
+        'names': ['C', 'D']
+    })
+    
+    # List DataFrame
+    df_list = DataFrame({
+        'values': [5.0, 6.0],
+        'names': ['E', 'F']
+    })
+    
+    # Test JAX + NumPy concatenation
+    result1 = df_jax.concat(df_numpy, axis=0)
+    assert result1.column_types['values'] == 'jax_array'  # JAX takes precedence
+    assert jnp.array_equal(result1['values'], jnp.array([1.0, 2.0, 3.0, 4.0]))
+    
+    # Test JAX + List concatenation
+    result2 = df_jax.concat(df_list, axis=0)
+    assert result2.column_types['values'] == 'jax_array'  # JAX takes precedence
+    assert jnp.array_equal(result2['values'], jnp.array([1.0, 2.0, 5.0, 6.0]))
+    
+    # Test NumPy + JAX concatenation (reverse order)
+    result3 = df_numpy.concat(df_jax, axis=0)
+    assert result3.column_types['values'] == 'jax_array'  # JAX takes precedence
+    assert jnp.array_equal(result3['values'], jnp.array([3.0, 4.0, 1.0, 2.0]))
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
+def test_concat_jax_horizontal():
+    """Test horizontal concatenation with JAX arrays."""
+    import jax.numpy as jnp
+    
+    df1 = DataFrame({
+        'names': ['Alice', 'Bob'],
+        'jax_values': jnp.array([1.0, 2.0])
+    })
+    
+    df2 = DataFrame({
+        'numpy_values': np.array([10.0, 20.0]),
+        'list_values': [100, 200]
+    })
+    
+    result = df1.concat(df2, axis=1)
+    
+    assert result.shape == (2, 4)
+    assert result.column_types['jax_values'] == 'jax_array'
+    assert result.column_types['numpy_values'] == 'array'
+    assert result.column_types['list_values'] == 'list'
+    
+    assert jnp.array_equal(result['jax_values'], jnp.array([1.0, 2.0]))
+    assert np.array_equal(result['numpy_values'], np.array([10.0, 20.0]))
+    assert result['list_values'] == [100, 200]
+
+
+@pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
+def test_concat_multiple_jax_dataframes():
+    """Test concatenating multiple DataFrames with JAX arrays using static method."""
+    import jax.numpy as jnp
+    
+    dfs = []
+    for i in range(3):
+        df = DataFrame({
+            'id': [f'id_{i}_0', f'id_{i}_1'],
+            'values': jnp.array([i*10.0, i*10.0 + 1.0])
+        }, name=f"df_{i}")
+        dfs.append(df)
+    
+    result = DataFrame.concat_dataframes(dfs, axis=0)
+    
+    assert result.shape == (6, 2)
+    expected_ids = ['id_0_0', 'id_0_1', 'id_1_0', 'id_1_1', 'id_2_0', 'id_2_1']
+    expected_values = jnp.array([0.0, 1.0, 10.0, 11.0, 20.0, 21.0])
+    
+    assert result['id'] == expected_ids
+    assert jnp.array_equal(result['values'], expected_values)
+    assert result.column_types['values'] == 'jax_array'
