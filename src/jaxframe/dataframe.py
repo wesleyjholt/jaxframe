@@ -41,10 +41,38 @@ class DataFrame:
                 raise TypeError("Column names must be strings")
             
             if isinstance(values, list):
-                # Keep as list, but make it immutable by storing a copy
-                self._data[column_name] = values.copy()
-                self._column_types[column_name] = 'list'
-                lengths.append(len(values))
+                # Check if this is a list containing JAX arrays that should be converted
+                try:
+                    import jax.numpy as jnp
+                    import jax
+                    
+                    # Check if any elements in the list are JAX arrays/tracers/scalars
+                    has_jax_elements = any(
+                        hasattr(v, 'shape') and hasattr(v, 'dtype') and
+                        (hasattr(v, 'device') or 
+                         str(type(v)).startswith('<class \'jaxlib.') or
+                         isinstance(v, (jax.Array, jax.core.Tracer)) or
+                         str(type(v).__module__).startswith('jax'))
+                        for v in values if v is not None
+                    )
+                    
+                    if has_jax_elements and values:
+                        # Convert the entire list to a JAX array
+                        # This handles mixed lists with JAX scalars and Python values
+                        jax_array = jnp.array(values)
+                        self._data[column_name] = jax_array
+                        self._column_types[column_name] = 'jax_array'
+                        lengths.append(len(values))
+                    else:
+                        # Keep as regular list
+                        self._data[column_name] = values.copy()
+                        self._column_types[column_name] = 'list'
+                        lengths.append(len(values))
+                except ImportError:
+                    # JAX not available, keep as regular list
+                    self._data[column_name] = values.copy()
+                    self._column_types[column_name] = 'list'
+                    lengths.append(len(values))
             elif isinstance(values, np.ndarray):
                 # Keep as numpy array
                 self._data[column_name] = values.copy()

@@ -127,9 +127,12 @@ def test_wide_to_long_with_jax_arrays():
     long_df = wide_to_long_masked(wide_df, 'sample_id')
     
     assert len(long_df) == 5
-    # Values should be converted to regular Python types for the long format
+    # Values should now be preserved as JAX arrays for computational efficiency
     long_dict = long_df.to_dict()
-    assert isinstance(long_dict['value'], list)
+    assert long_df.column_types['value'] == 'jax_array'
+    # Verify it's a proper 1D JAX array, not a list of individual JAX arrays
+    assert isinstance(long_dict['value'], jnp.ndarray)
+    assert long_dict['value'].ndim == 1
 
 
 def test_long_to_wide_basic():
@@ -598,3 +601,45 @@ def test_jax_arrays_remain_jax_arrays():
     assert abs(sum_val0 - 4.0) < 1e-6
     
     print("✓ JAX arrays preserved as JAX arrays in DataFrame!")
+
+
+@pytest.mark.skipif(not jax_available, reason="JAX not available")
+def test_transform_functions_create_proper_jax_arrays():
+    """Test that transform functions create proper 1D JAX arrays instead of lists of individual JAX arrays."""
+    
+    # Test wide_to_long_masked
+    wide_data = {
+        'id': ['A', 'B', 'C'],
+        'var$0$value': jnp.array([1.0, 2.0, 3.0]),
+        'var$1$value': jnp.array([4.0, 5.0, 6.0]),
+        'var$0$mask': jnp.array([True, True, True]),
+        'var$1$mask': jnp.array([True, True, False])
+    }
+    
+    wide_df = DataFrame(wide_data)
+    long_df = wide_to_long_masked(wide_df, 'id')
+    
+    # Check that the value column is a proper JAX array, not a list
+    assert long_df.column_types['value'] == 'jax_array'
+    value_col = long_df.to_dict()['value']
+    assert isinstance(value_col, jnp.ndarray)
+    assert value_col.ndim == 1
+    assert len(value_col) == 5  # Should have 5 values
+    
+    # Test long_to_wide_masked with mixed values (JAX elements + fill values)
+    long_data = {
+        'id': ['A', 'A', 'B'],
+        'variable': [0, 1, 0],
+        'value': jnp.array([1.0, 2.0, 3.0])
+    }
+    
+    long_df2 = DataFrame(long_data)
+    wide_df2 = long_to_wide_masked(long_df2, 'id', 'value', 'variable', 'var')
+    
+    # Check that all value columns are proper JAX arrays
+    for col_name in wide_df2.columns:
+        if 'value' in col_name:
+            assert wide_df2.column_types[col_name] == 'jax_array'
+            col_data = wide_df2.to_dict()[col_name]
+            assert isinstance(col_data, jnp.ndarray)
+            assert col_data.ndim == 1
