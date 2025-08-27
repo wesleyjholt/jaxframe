@@ -838,3 +838,171 @@ class DataFrame:
             result = result.concat(df, axis=axis, ignore_index=ignore_index)
         
         return result
+    
+    def is_valid_lookup_table(self, id_columns: Union[str, List[str]]) -> bool:
+        """
+        Check if the DataFrame is a valid lookup table (no duplicate keys).
+        
+        Args:
+            id_columns: Column name(s) that form the lookup key
+            
+        Returns:
+            True if no duplicate keys exist, False otherwise
+        """
+        if isinstance(id_columns, str):
+            id_columns = [id_columns]
+        
+        # Check that all id_columns exist
+        for col in id_columns:
+            if col not in self._columns:
+                raise KeyError(f"Column '{col}' not found. Available columns: {list(self._columns)}")
+        
+        # Get all key combinations
+        keys_seen = set()
+        for row_idx in range(len(self)):
+            key_tuple = tuple(self[col][row_idx] for col in id_columns)
+            if key_tuple in keys_seen:
+                return False
+            keys_seen.add(key_tuple)
+        
+        return True
+    
+    def update_lookup_table(self, other: 'DataFrame', id_columns: Union[str, List[str]], 
+                           strict: bool = True) -> 'DataFrame':
+        """
+        Update this lookup table with rows from another DataFrame.
+        
+        Args:
+            other: DataFrame containing rows to add/update
+            id_columns: Column name(s) that form the lookup key
+            strict: If True, raises error on value mismatches. If False, replaces with new values.
+            
+        Returns:
+            New DataFrame with updated lookup table
+            
+        Raises:
+            ValueError: If DataFrames have incompatible columns or if strict=True and values mismatch
+            KeyError: If id_columns don't exist in both DataFrames
+        """
+        if isinstance(id_columns, str):
+            id_columns = [id_columns]
+            
+        # Validate that both DataFrames have the required columns
+        for col in id_columns:
+            if col not in self._columns:
+                raise KeyError(f"Column '{col}' not found in current DataFrame. Available: {list(self._columns)}")
+            if col not in other._columns:
+                raise KeyError(f"Column '{col}' not found in other DataFrame. Available: {list(other._columns)}")
+        
+        # Check that both DataFrames have the same set of columns
+        if set(self._columns) != set(other._columns):
+            raise ValueError(f"DataFrames must have the same columns. "
+                           f"Current: {set(self._columns)}, Other: {set(other._columns)}")
+        
+        # Check that current DataFrame is a valid lookup table
+        if not self.is_valid_lookup_table(id_columns):
+            raise ValueError("Current DataFrame is not a valid lookup table (has duplicate keys)")
+        
+        # Check that other DataFrame is a valid lookup table
+        if not other.is_valid_lookup_table(id_columns):
+            raise ValueError("Other DataFrame is not a valid lookup table (has duplicate keys)")
+        
+        # Build index of existing keys in current DataFrame
+        existing_keys = {}  # key_tuple -> row_index
+        for row_idx in range(len(self)):
+            key_tuple = tuple(self[col][row_idx] for col in id_columns)
+            existing_keys[key_tuple] = row_idx
+        
+        # Start with a copy of current data, converting to lists for mutability
+        new_data = {}
+        for col in self._columns:
+            if isinstance(self._data[col], list):
+                new_data[col] = self._data[col].copy()
+            else:
+                # Convert arrays (numpy or JAX) to lists so we can append
+                new_data[col] = list(self._data[col])
+        
+        # Process each row in the other DataFrame
+        for other_row_idx in range(len(other)):
+            key_tuple = tuple(other[col][other_row_idx] for col in id_columns)
+            
+            if key_tuple in existing_keys:
+                # Key exists - check for value conflicts or replace
+                existing_row_idx = existing_keys[key_tuple]
+                
+                if strict:
+                    # Check all non-key columns for mismatches
+                    for col in self._columns:
+                        if col not in id_columns:
+                            existing_val = self[col][existing_row_idx]
+                            new_val = other[col][other_row_idx]
+                            
+                            # Handle different data types for comparison
+                            if not self._values_equal(existing_val, new_val):
+                                raise ValueError(f"Value mismatch for key {key_tuple} in column '{col}': "
+                                               f"existing='{existing_val}', new='{new_val}'")
+                else:
+                    # Replace existing values with new ones
+                    for col in self._columns:
+                        if col not in id_columns:
+                            new_data[col][existing_row_idx] = other[col][other_row_idx]
+            else:
+                # New key - add the row
+                for col in self._columns:
+                    new_data[col].append(other[col][other_row_idx])
+        
+        # Determine new name
+        if self._name and other._name:
+            new_name = f"{self._name}_updated_with_{other._name}"
+        elif self._name:
+            new_name = f"{self._name}_updated"
+        elif other._name:
+            new_name = f"updated_with_{other._name}"
+        else:
+            new_name = "updated_lookup"
+        
+        return DataFrame(new_data, name=new_name)
+    
+    def replace_lookup_table(self, other: 'DataFrame', id_columns: Union[str, List[str]]) -> 'DataFrame':
+        """
+        Update this lookup table with rows from another DataFrame, replacing conflicting values.
+        
+        This is a convenience method equivalent to update_lookup_table with strict=False.
+        
+        Args:
+            other: DataFrame containing rows to add/update
+            id_columns: Column name(s) that form the lookup key
+            
+        Returns:
+            New DataFrame with updated lookup table where new values replace old ones
+        """
+        return self.update_lookup_table(other, id_columns, strict=False)
+    
+    def _values_equal(self, val1: Any, val2: Any) -> bool:
+        """
+        Helper method to compare two values for equality, handling different data types.
+        
+        Args:
+            val1: First value
+            val2: Second value
+            
+        Returns:
+            True if values are considered equal, False otherwise
+        """
+        try:
+            # Handle JAX arrays
+            import jax.numpy as jnp
+            if hasattr(val1, 'shape') and hasattr(val2, 'shape'):
+                return jnp.allclose(val1, val2, equal_nan=True)
+        except ImportError:
+            pass
+        
+        # Handle numpy arrays
+        if hasattr(val1, 'shape') and hasattr(val2, 'shape'):
+            return np.allclose(val1, val2, equal_nan=True)
+        
+        # Handle regular values
+        if isinstance(val1, float) and isinstance(val2, float):
+            return abs(val1 - val2) < 1e-10
+        
+        return val1 == val2
