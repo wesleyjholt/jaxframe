@@ -424,6 +424,175 @@ def test_join_inner_join_behavior():
         pass  # Skip JAX test if not available
 
 
+def test_exists_semi_join():
+    """Test the exists method for semi-join operations."""
+    # Create test DataFrames
+    customers_data = {
+        'customer_id': ['C1', 'C2', 'C3', 'C4', 'C5'],
+        'name': ['Alice', 'Bob', 'Charlie', 'David', 'Eve'],
+        'city': ['NY', 'LA', 'NY', 'SF', 'LA']
+    }
+    customers = DataFrame(customers_data, name="customers")
+    
+    orders_data = {
+        'order_id': ['O1', 'O2', 'O3', 'O4', 'O5'],
+        'customer_id': ['C1', 'C1', 'C3', 'C3', 'C5'],  # C2 and C4 have no orders
+        'amount': [100, 150, 200, 75, 300]
+    }
+    orders = DataFrame(orders_data, name="orders")
+    
+    # Test basic semi-join
+    customers_with_orders = customers.exists(orders, on='customer_id')
+    
+    # Should only include customers who have orders: C1, C3, C5
+    assert len(customers_with_orders) == 3, f"Expected 3 customers, got {len(customers_with_orders)}"
+    
+    expected_customers = ['C1', 'C3', 'C5']
+    actual_customers = list(customers_with_orders['customer_id'])
+    assert actual_customers == expected_customers, f"Expected {expected_customers}, got {actual_customers}"
+    
+    # Should preserve original column structure
+    assert list(customers_with_orders.columns) == list(customers.columns)
+    assert customers_with_orders.columns == ('customer_id', 'name', 'city')
+    
+    # Should not add any columns from orders DataFrame
+    assert 'order_id' not in customers_with_orders.columns
+    assert 'amount' not in customers_with_orders.columns
+    
+    # Check specific values
+    assert customers_with_orders['name'][0] == 'Alice'  # C1
+    assert customers_with_orders['name'][1] == 'Charlie'  # C3
+    assert customers_with_orders['name'][2] == 'Eve'  # C5
+
+
+def test_exists_duplicate_elimination():
+    """Test that exists eliminates duplicates automatically."""
+    # Create DataFrames where left has duplicates and right has multiple matches
+    left_data = {
+        'id': ['A', 'A', 'B', 'B', 'C'],  # Duplicates in left
+        'value': [1, 1, 2, 2, 3]
+    }
+    left_df = DataFrame(left_data, name="left")
+    
+    right_data = {
+        'id': ['A', 'A', 'A', 'B'],  # Multiple matches for A and B
+        'other': [10, 20, 30, 40]
+    }
+    right_df = DataFrame(right_data, name="right")
+    
+    result = left_df.exists(right_df, on='id')
+    
+    # Should eliminate duplicates - only one row for each unique key
+    assert len(result) == 2, f"Expected 2 unique rows, got {len(result)}"
+    assert list(result['id']) == ['A', 'B'], f"Expected ['A', 'B'], got {list(result['id'])}"
+    assert list(result['value']) == [1, 2], f"Expected [1, 2], got {list(result['value'])}"
+
+
+def test_exists_multi_column():
+    """Test exists with multi-column joins."""
+    # Create test data for multi-column join
+    users_data = {
+        'user_id': ['U1', 'U2', 'U3', 'U4'],
+        'region': ['US', 'US', 'EU', 'EU'],
+        'active': [True, False, True, True]
+    }
+    users = DataFrame(users_data, name="users")
+    
+    sessions_data = {
+        'session_id': ['S1', 'S2', 'S3'],
+        'user_id': ['U1', 'U3', 'U1'],
+        'region': ['US', 'EU', 'US'],
+        'duration': [30, 45, 60]
+    }
+    sessions = DataFrame(sessions_data, name="sessions")
+    
+    # Find users who have sessions in their region
+    active_users = users.exists(sessions, on=['user_id', 'region'])
+    
+    # Should find U1 (US) and U3 (EU), but not U2 or U4
+    assert len(active_users) == 2, f"Expected 2 users, got {len(active_users)}"
+    assert list(active_users['user_id']) == ['U1', 'U3']
+    assert list(active_users['region']) == ['US', 'EU']
+
+
+def test_exists_with_jax_arrays():
+    """Test exists with JAX arrays."""
+    try:
+        import jax.numpy as jnp
+        
+        # Create DataFrames with JAX arrays
+        left_data = {
+            'id': ['A', 'B', 'C', 'D'],
+            'values': jnp.array([1.0, 2.0, 3.0, 4.0])
+        }
+        left_df = DataFrame(left_data, name="left")
+        
+        right_data = {
+            'id': ['B', 'D', 'E'],
+            'other_values': jnp.array([20.0, 40.0, 50.0])
+        }
+        right_df = DataFrame(right_data, name="right")
+        
+        result = left_df.exists(right_df, on='id')
+        
+        # Should include B and D
+        assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
+        assert list(result['id']) == ['B', 'D']
+        assert abs(result['values'][0] - 2.0) < 1e-10
+        assert abs(result['values'][1] - 4.0) < 1e-10
+        
+        # Verify JAX array type is preserved
+        assert result.column_types['values'] == 'jax_array'
+        
+    except ImportError:
+        pass  # Skip JAX test if not available
+
+
+def test_exists_empty_result():
+    """Test exists when no matches are found."""
+    left_data = {
+        'id': ['A', 'B', 'C'],
+        'value': [1, 2, 3]
+    }
+    left_df = DataFrame(left_data, name="left")
+    
+    right_data = {
+        'id': ['X', 'Y', 'Z'],
+        'other': [10, 20, 30]
+    }
+    right_df = DataFrame(right_data, name="right")
+    
+    result = left_df.exists(right_df, on='id')
+    
+    # Should return empty DataFrame with same structure
+    assert len(result) == 0, f"Expected empty result, got {len(result)} rows"
+    assert list(result.columns) == list(left_df.columns)
+    assert result.name == left_df.name
+
+
+def test_exists_error_conditions():
+    """Test error conditions for exists method."""
+    left_data = {
+        'id': ['A', 'B'],
+        'value': [1, 2]
+    }
+    left_df = DataFrame(left_data)
+    
+    right_data = {
+        'other_id': ['A', 'B'],
+        'other_value': [10, 20]
+    }
+    right_df = DataFrame(right_data)
+    
+    # Test missing column in left DataFrame
+    with pytest.raises(ValueError, match="Column 'missing' not found in left DataFrame"):
+        left_df.exists(right_df, on='missing')
+    
+    # Test missing column in right DataFrame
+    with pytest.raises(ValueError, match="Column 'id' not found in right DataFrame"):
+        left_df.exists(right_df, on='id')
+
+
 def test_add_column():
     """Test adding columns to DataFrame."""
     data = {

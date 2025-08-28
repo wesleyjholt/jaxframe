@@ -509,6 +509,112 @@ class DataFrame:
         new_name = f"{self._name}_joined" if self._name else None
         return DataFrame(new_data, name=new_name)
     
+    def exists(self, other: 'DataFrame', on: Union[str, List[str]]) -> 'DataFrame':
+        """
+        Perform a semi-join operation using EXISTS logic.
+        
+        Returns rows from this DataFrame where there are corresponding matches
+        in the other DataFrame, but only includes columns from this DataFrame.
+        Automatically eliminates duplicates if multiple matches exist.
+        
+        Args:
+            other: The DataFrame to check for matching rows
+            on: Column name(s) to join on. Can be a string for single column
+                or list of strings for multi-column joins
+                
+        Returns:
+            A new DataFrame with rows from this DataFrame where matches exist
+            in the other DataFrame
+            
+        Example:
+            # Filter customers who have orders
+            customers_with_orders = customers.exists(orders, on='customer_id')
+            
+            # Multi-column exists
+            active_users = users.exists(sessions, on=['user_id', 'region'])
+        """
+        from typing import Union, List
+        
+        # Normalize on parameter to list
+        if isinstance(on, str):
+            on_columns = [on]
+        else:
+            on_columns = on
+            
+        # Validate join columns exist
+        for col in on_columns:
+            if col not in self.columns:
+                raise ValueError(f"Column '{col}' not found in left DataFrame")
+            if col not in other.columns:
+                raise ValueError(f"Column '{col}' not found in right DataFrame")
+        
+        # Create lookup set from other DataFrame for existence check
+        # For multi-column joins, create tuples of values
+        if len(on_columns) == 1:
+            col = on_columns[0]
+            other_keys = set(other[col])
+        else:
+            # Create tuples for multi-column keys
+            other_keys = set()
+            for i in range(len(other)):
+                key_tuple = tuple(other[col][i] for col in on_columns)
+                other_keys.add(key_tuple)
+        
+        # Find matching rows in this DataFrame (preserving order, eliminating duplicates)
+        matching_indices = []
+        seen_keys = set()
+        
+        for i in range(len(self)):
+            if len(on_columns) == 1:
+                col = on_columns[0]
+                key = self[col][i]
+            else:
+                key = tuple(self[col][i] for col in on_columns)
+            
+            # Check if key exists in other DataFrame and we haven't seen this key yet
+            if key in other_keys and key not in seen_keys:
+                matching_indices.append(i)
+                seen_keys.add(key)
+        
+        # Return subset of this DataFrame with only matching rows
+        if not matching_indices:
+            # Return empty DataFrame with same structure
+            empty_data = {}
+            for col in self.columns:
+                if self.column_types[col] == 'list':
+                    empty_data[col] = []
+                elif self.column_types[col] == 'jax_array':
+                    try:
+                        import jax.numpy as jnp
+                        empty_data[col] = jnp.array([], dtype=self._data[col].dtype)
+                    except ImportError:
+                        import numpy as np
+                        empty_data[col] = np.array([], dtype=self._data[col].dtype)
+                else:  # numpy array
+                    import numpy as np
+                    empty_data[col] = np.array([], dtype=self._data[col].dtype)
+            return DataFrame(empty_data, name=self.name)
+        
+        # Create new data dictionary with matching rows
+        new_data = {}
+        for col in self.columns:
+            if self.column_types[col] == 'list':
+                new_data[col] = [self._data[col][i] for i in matching_indices]
+            elif self.column_types[col] == 'jax_array':
+                # For JAX arrays, use advanced indexing
+                try:
+                    import jax.numpy as jnp
+                    new_data[col] = self._data[col][jnp.array(matching_indices)]
+                except ImportError:
+                    # JAX not available, fall back to numpy
+                    import numpy as np
+                    new_data[col] = self._data[col][matching_indices]
+            else:  # numpy array
+                import numpy as np
+                new_data[col] = self._data[col][matching_indices]
+        
+        return DataFrame(new_data, name=self.name)
+    
     def add_column(self, column_name: str, values: Union[List, np.ndarray, Any]) -> 'DataFrame':
         """
         Add a new column to the DataFrame, returning a new DataFrame.
