@@ -424,8 +424,8 @@ def test_join_inner_join_behavior():
         pass  # Skip JAX test if not available
 
 
-def test_exists_semi_join():
-    """Test the exists method for semi-join operations."""
+def test_join_semi_join():
+    """Test the join method with how='semi' for semi-join operations."""
     # Create test DataFrames
     customers_data = {
         'customer_id': ['C1', 'C2', 'C3', 'C4', 'C5'],
@@ -442,7 +442,7 @@ def test_exists_semi_join():
     orders = DataFrame(orders_data, name="orders")
     
     # Test basic semi-join
-    customers_with_orders = customers.exists(orders, on='customer_id')
+    customers_with_orders = customers.join(orders, on='customer_id', how='semi')
     
     # Should only include customers who have orders: C1, C3, C5
     assert len(customers_with_orders) == 3, f"Expected 3 customers, got {len(customers_with_orders)}"
@@ -465,8 +465,8 @@ def test_exists_semi_join():
     assert customers_with_orders['name'][2] == 'Eve'  # C5
 
 
-def test_exists_duplicate_elimination():
-    """Test that exists eliminates duplicates automatically."""
+def test_join_semi_duplicate_elimination():
+    """Test that join with how='semi' eliminates duplicates automatically."""
     # Create DataFrames where left has duplicates and right has multiple matches
     left_data = {
         'id': ['A', 'A', 'B', 'B', 'C'],  # Duplicates in left
@@ -480,7 +480,7 @@ def test_exists_duplicate_elimination():
     }
     right_df = DataFrame(right_data, name="right")
     
-    result = left_df.exists(right_df, on='id')
+    result = left_df.join(right_df, on='id', how='semi')
     
     # Should eliminate duplicates - only one row for each unique key
     assert len(result) == 2, f"Expected 2 unique rows, got {len(result)}"
@@ -488,8 +488,8 @@ def test_exists_duplicate_elimination():
     assert list(result['value']) == [1, 2], f"Expected [1, 2], got {list(result['value'])}"
 
 
-def test_exists_multi_column():
-    """Test exists with multi-column joins."""
+def test_join_semi_multi_column():
+    """Test join with how='semi' with multi-column joins."""
     # Create test data for multi-column join
     users_data = {
         'user_id': ['U1', 'U2', 'U3', 'U4'],
@@ -507,7 +507,7 @@ def test_exists_multi_column():
     sessions = DataFrame(sessions_data, name="sessions")
     
     # Find users who have sessions in their region
-    active_users = users.exists(sessions, on=['user_id', 'region'])
+    active_users = users.join(sessions, on=['user_id', 'region'], how='semi')
     
     # Should find U1 (US) and U3 (EU), but not U2 or U4
     assert len(active_users) == 2, f"Expected 2 users, got {len(active_users)}"
@@ -515,8 +515,8 @@ def test_exists_multi_column():
     assert list(active_users['region']) == ['US', 'EU']
 
 
-def test_exists_with_jax_arrays():
-    """Test exists with JAX arrays."""
+def test_join_semi_with_jax_arrays():
+    """Test join with how='semi' with JAX arrays."""
     try:
         import jax.numpy as jnp
         
@@ -533,7 +533,7 @@ def test_exists_with_jax_arrays():
         }
         right_df = DataFrame(right_data, name="right")
         
-        result = left_df.exists(right_df, on='id')
+        result = left_df.join(right_df, on='id', how='semi')
         
         # Should include B and D
         assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
@@ -548,8 +548,8 @@ def test_exists_with_jax_arrays():
         pass  # Skip JAX test if not available
 
 
-def test_exists_empty_result():
-    """Test exists when no matches are found."""
+def test_join_semi_empty_result():
+    """Test join with how='semi' when no matches are found."""
     left_data = {
         'id': ['A', 'B', 'C'],
         'value': [1, 2, 3]
@@ -562,7 +562,7 @@ def test_exists_empty_result():
     }
     right_df = DataFrame(right_data, name="right")
     
-    result = left_df.exists(right_df, on='id')
+    result = left_df.join(right_df, on='id', how='semi')
     
     # Should return empty DataFrame with same structure
     assert len(result) == 0, f"Expected empty result, got {len(result)} rows"
@@ -570,8 +570,8 @@ def test_exists_empty_result():
     assert result.name == left_df.name
 
 
-def test_exists_error_conditions():
-    """Test error conditions for exists method."""
+def test_join_semi_error_conditions():
+    """Test error conditions for join method with how='semi'."""
     left_data = {
         'id': ['A', 'B'],
         'value': [1, 2]
@@ -585,12 +585,35 @@ def test_exists_error_conditions():
     right_df = DataFrame(right_data)
     
     # Test missing column in left DataFrame
-    with pytest.raises(ValueError, match="Column 'missing' not found in left DataFrame"):
-        left_df.exists(right_df, on='missing')
+    with pytest.raises(KeyError, match="Column 'missing' not found in left DataFrame"):
+        left_df.join(right_df, on='missing', how='semi')
     
     # Test missing column in right DataFrame
-    with pytest.raises(ValueError, match="Column 'id' not found in right DataFrame"):
-        left_df.exists(right_df, on='id')
+    with pytest.raises(KeyError, match="Column 'id' not found in right DataFrame"):
+        left_df.join(right_df, on='id', how='semi')
+
+
+def test_join_how_parameter_validation():
+    """Test validation of the 'how' parameter."""
+    left_data = {
+        'id': ['A', 'B'],
+        'value': [1, 2]
+    }
+    left_df = DataFrame(left_data)
+    
+    right_data = {
+        'id': ['A', 'B'],
+        'other_value': [10, 20]
+    }
+    right_df = DataFrame(right_data)
+    
+    # Test invalid 'how' parameter
+    with pytest.raises(ValueError, match="'how' must be 'inner' or 'semi', got 'invalid'"):
+        left_df.join(right_df, on='id', how='invalid')
+    
+    # Test missing source for inner join
+    with pytest.raises(ValueError, match="'source' parameter is required for inner joins"):
+        left_df.join(right_df, on='id', how='inner')
 
 
 def test_add_column():
