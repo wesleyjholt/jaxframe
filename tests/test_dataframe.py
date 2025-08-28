@@ -274,13 +274,24 @@ def test_join_column():
     with pytest.raises(ValueError, match="Duplicate values found"):
         df1.join(df2_duplicates, on='assay_id', source='var')
     
-    # Test missing value in lookup
+    # Test inner join behavior: missing value in lookup should result in empty DataFrame
     df1_missing = DataFrame({
         'sample_id': ['001'],
         'assay_id': ['03']  # Not in df2
     })
-    with pytest.raises(ValueError, match="not found in other DataFrame"):
-        df1_missing.join(df2, on='assay_id', source='var')
+    result_missing = df1_missing.join(df2, on='assay_id', source='var')
+    assert len(result_missing) == 0, "Inner join with no matching keys should return empty DataFrame"
+    assert result_missing.shape[1] == 3, "Should have all columns even when empty"  # sample_id, assay_id, params/var
+    
+    # Test partial match - some rows match, some don't
+    df1_partial = DataFrame({
+        'sample_id': ['001', '002', '003'],
+        'assay_id': ['01', '03', '02']  # '03' is not in df2
+    })
+    result_partial = df1_partial.join(df2, on='assay_id', source='var')
+    assert len(result_partial) == 2, "Should include only matching rows"
+    assert list(result_partial['assay_id']) == ['01', '02'], "Should include only rows with matching keys"
+    assert list(result_partial['params/var']) == [10, 20], "Should have correct joined values"
 
 
 def test_join_multiple_columns():
@@ -355,6 +366,62 @@ def test_join_multiple_columns():
     assert isinstance(result['treatments/dose'][0], (float, np.floating))  # numpy array
     assert isinstance(result['treatments/duration'][0], int)  # list
     assert isinstance(result['treatments/category'][0], str)  # list
+
+
+def test_join_inner_join_behavior():
+    """Test that join behaves like an inner join, excluding non-matching rows."""
+    # Create test DataFrames with some matching and some non-matching keys
+    left_data = {
+        'id': ['A', 'B', 'C', 'D', 'E'],
+        'left_value': [1, 2, 3, 4, 5]
+    }
+    left_df = DataFrame(left_data, name="left")
+    
+    right_data = {
+        'id': ['B', 'D', 'F'],  # Only B and D match with left
+        'right_value': [20, 40, 60]
+    }
+    right_df = DataFrame(right_data, name="right")
+    
+    # Perform inner join
+    result = left_df.join(right_df, on='id', source='right_value')
+    
+    # Should only include rows where keys match
+    assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
+    assert list(result['id']) == ['B', 'D'], f"Expected ['B', 'D'], got {list(result['id'])}"
+    assert list(result['left_value']) == [2, 4], f"Expected [2, 4], got {list(result['left_value'])}"
+    assert list(result['right/right_value']) == [20, 40], f"Expected [20, 40], got {list(result['right/right_value'])}"
+    
+    # Test with JAX arrays
+    try:
+        import jax.numpy as jnp
+        
+        left_jax_data = {
+            'id': ['A', 'B', 'C'],
+            'values': jnp.array([1.0, 2.0, 3.0])
+        }
+        left_jax_df = DataFrame(left_jax_data, name="left_jax")
+        
+        right_jax_data = {
+            'id': ['B', 'D'],  # Only B matches
+            'other_values': jnp.array([20.0, 40.0])
+        }
+        right_jax_df = DataFrame(right_jax_data, name="right_jax")
+        
+        result_jax = left_jax_df.join(right_jax_df, on='id', source='other_values')
+        
+        # Should only include the matching row
+        assert len(result_jax) == 1, f"Expected 1 row, got {len(result_jax)}"
+        assert result_jax['id'][0] == 'B', f"Expected 'B', got {result_jax['id'][0]}"
+        assert abs(result_jax['values'][0] - 2.0) < 1e-10, f"Expected 2.0, got {result_jax['values'][0]}"
+        assert abs(result_jax['right_jax/other_values'][0] - 20.0) < 1e-10, f"Expected 20.0, got {result_jax['right_jax/other_values'][0]}"
+        
+        # Verify JAX array types are preserved
+        assert result_jax.column_types['values'] == 'jax_array'
+        assert result_jax.column_types['right_jax/other_values'] == 'jax_array'
+        
+    except ImportError:
+        pass  # Skip JAX test if not available
 
 
 def test_add_column():

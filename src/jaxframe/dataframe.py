@@ -433,44 +433,77 @@ class DataFrame:
         # Create new data with joined columns
         new_data = {}
         
-        # Copy existing columns
+        # First, determine which rows from the left DataFrame should be included (inner join)
+        self_join_values = self[on]
+        valid_indices = []  # Indices of rows that will be included in the result
+        
+        # Find all indices where the join key exists in the right DataFrame
+        for i, value in enumerate(self_join_values):
+            if value in lookups[source_columns[0]]:  # Check if key exists in lookup
+                valid_indices.append(i)
+        
+        # Copy existing columns but only for valid indices
         for col in self._columns:
             if self._column_types[col] == 'list':
-                new_data[col] = self._data[col].copy()
+                new_data[col] = [self._data[col][i] for i in valid_indices]
             elif self._column_types[col] == 'jax_array':
-                # JAX arrays are immutable, so we can use them directly
-                new_data[col] = self._data[col]
+                # For JAX arrays, use advanced indexing to avoid list conversion
+                try:
+                    import jax.numpy as jnp
+                    if valid_indices:
+                        new_data[col] = self._data[col][jnp.array(valid_indices)]
+                    else:
+                        # Empty result - create empty array with same dtype
+                        new_data[col] = jnp.array([], dtype=self._data[col].dtype)
+                except ImportError:
+                    # JAX not available, fall back to numpy
+                    import numpy as np
+                    if valid_indices:
+                        new_data[col] = self._data[col][valid_indices]
+                    else:
+                        new_data[col] = np.array([], dtype=self._data[col].dtype)
             else:  # numpy array
-                new_data[col] = self._data[col].copy()
+                import numpy as np
+                if valid_indices:
+                    new_data[col] = self._data[col][valid_indices]
+                else:
+                    new_data[col] = np.array([], dtype=self._data[col].dtype)
         
         # Add the joined columns
-        self_join_values = self[on]
-        
         for src_col, target_col in zip(source_columns, target_columns):
-            joined_values = []
             lookup = lookups[src_col]
+            joined_values = []
             
-            for value in self_join_values:
-                if value in lookup:
-                    joined_values.append(lookup[value])
-                else:
-                    raise ValueError(f"Value '{value}' from '{on}' not found in other DataFrame")
+            # Only process valid indices
+            for i in valid_indices:
+                value = self_join_values[i]
+                joined_values.append(lookup[value])
             
             # Preserve the type from the source column
             if other._column_types[src_col] == 'list':
                 new_data[target_col] = joined_values
             elif other._column_types[src_col] == 'jax_array':
-                # For JAX arrays, we need to create a new JAX array from the joined values
+                # For JAX arrays, convert efficiently without intermediate list conversion
                 try:
                     import jax.numpy as jnp
-                    new_data[target_col] = jnp.array(joined_values)
+                    if joined_values:
+                        new_data[target_col] = jnp.array(joined_values)
+                    else:
+                        # Empty result - create empty array with same dtype as source
+                        new_data[target_col] = jnp.array([], dtype=other._data[src_col].dtype)
                 except ImportError:
                     # JAX not available, fall back to numpy
                     import numpy as np
-                    new_data[target_col] = np.asarray(joined_values)
+                    if joined_values:
+                        new_data[target_col] = np.asarray(joined_values)
+                    else:
+                        new_data[target_col] = np.array([], dtype=other._data[src_col].dtype)
             else:  # numpy array
                 import numpy as np
-                new_data[target_col] = np.asarray(joined_values)
+                if joined_values:
+                    new_data[target_col] = np.asarray(joined_values)
+                else:
+                    new_data[target_col] = np.array([], dtype=other._data[src_col].dtype)
         
         # Create new DataFrame with updated name
         new_name = f"{self._name}_joined" if self._name else None
