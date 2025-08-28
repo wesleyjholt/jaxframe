@@ -352,72 +352,72 @@ class DataFrame:
 
         return pd.DataFrame(data)
     
-    def join_column(self, other: 'DataFrame', on_column: str, 
-                   source_column: Union[str, List[str]], 
-                   target_column: Union[str, List[str], None] = None) -> 'DataFrame':
+    def join(self, other: 'DataFrame', on: str, 
+             source: Union[str, List[str]], 
+             target: Union[str, List[str], None] = None) -> 'DataFrame':
         """
         Join this DataFrame with another DataFrame by adding column(s) from the other DataFrame.
         
         Args:
             other: The DataFrame to join with
-            on_column: The column name to join on (must exist in both DataFrames)
-            source_column: The column name(s) in the other DataFrame to copy values from.
-                          Can be a string for single column or list of strings for multiple columns.
-            target_column: The name(s) for the new column(s) in the result. If None, 
-                          defaults to '{other.name}/{source_column}' if other has a name,
-                          otherwise just source_column. Can be a string for single column,
-                          list of strings for multiple columns, or None for auto-naming.
+            on: The column name to join on (must exist in both DataFrames)
+            source: The column name(s) in the other DataFrame to copy values from.
+                   Can be a string for single column or list of strings for multiple columns.
+            target: The name(s) for the new column(s) in the result. If None, 
+                   defaults to '{other.name}/{source}' if other has a name,
+                   otherwise just source. Can be a string for single column,
+                   list of strings for multiple columns, or None for auto-naming.
         
         Returns:
             A new DataFrame with the joined column(s) added
             
         Raises:
-            KeyError: If on_column doesn't exist in both DataFrames or source_column(s) 
+            KeyError: If on doesn't exist in both DataFrames or source column(s) 
                      don't exist in other DataFrame
-            ValueError: If there are duplicate values in the on_column of other DataFrame,
-                       or if target_column list length doesn't match source_column list length
+            ValueError: If there are duplicate values in the on column of other DataFrame,
+                       or if target list length doesn't match source list length
         """
         from typing import Union, List
         
         # Normalize inputs to lists
-        if isinstance(source_column, str):
-            source_columns = [source_column]
+        if isinstance(source, str):
+            source_columns = [source]
         else:
-            source_columns = source_column
+            source_columns = source
             
-        if target_column is None:
+        if target is None:
             target_columns = None
-        elif isinstance(target_column, str):
-            target_columns = [target_column]
+        elif isinstance(target, str):
+            target_columns = [target]
         else:
-            target_columns = target_column
+            target_columns = target
             
         # Validate target_columns length if provided
         if target_columns is not None and len(target_columns) != len(source_columns):
-            raise ValueError(f"Length of target_column list ({len(target_columns)}) must match "
-                           f"length of source_column list ({len(source_columns)})")
+            raise ValueError(f"Length of target list ({len(target_columns)}) must match "
+                           f"length of source list ({len(source_columns)})")
         
         # Validate inputs
-        if on_column not in self._columns:
-            raise KeyError(f"Column '{on_column}' not found in this DataFrame")
-        if on_column not in other._columns:
-            raise KeyError(f"Column '{on_column}' not found in other DataFrame")
+        if on not in self._columns:
+            raise KeyError(f"Column '{on}' not found in this DataFrame")
+        if on not in other._columns:
+            raise KeyError(f"Column '{on}' not found in other DataFrame")
         
         for src_col in source_columns:
             if src_col not in other._columns:
                 raise KeyError(f"Column '{src_col}' not found in other DataFrame")
         
         # Check for duplicates in the join column of other DataFrame
-        other_join_values = other[on_column]
+        other_join_values = other[on]
         if len(set(other_join_values)) != len(other_join_values):
-            raise ValueError(f"Duplicate values found in '{on_column}' column of other DataFrame")
+            raise ValueError(f"Duplicate values found in '{on}' column of other DataFrame")
         
         # Create lookup dictionaries from other DataFrame for each source column
         lookups = {}
         for src_col in source_columns:
             lookups[src_col] = {}
             for i in range(len(other)):
-                key = other._data[on_column][i]
+                key = other._data[on][i]
                 value = other._data[src_col][i]
                 lookups[src_col][key] = value
         
@@ -444,7 +444,7 @@ class DataFrame:
                 new_data[col] = self._data[col].copy()
         
         # Add the joined columns
-        self_join_values = self[on_column]
+        self_join_values = self[on]
         
         for src_col, target_col in zip(source_columns, target_columns):
             joined_values = []
@@ -454,7 +454,7 @@ class DataFrame:
                 if value in lookup:
                     joined_values.append(lookup[value])
                 else:
-                    raise ValueError(f"Value '{value}' from '{on_column}' not found in other DataFrame")
+                    raise ValueError(f"Value '{value}' from '{on}' not found in other DataFrame")
             
             # Preserve the type from the source column
             if other._column_types[src_col] == 'list':
