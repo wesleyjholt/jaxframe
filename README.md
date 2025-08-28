@@ -68,3 +68,6 @@ pytest -v
 - **Length validation**: All columns must have the same length
 - **Mixed types**: Supports both Python lists and NumPy arrays as columns
 - **Type-aware operations**: Column selection, equality, etc. preserve original types
+
+## TODO:
+- Pretty print with jax tracers

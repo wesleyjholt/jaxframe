@@ -108,8 +108,8 @@ def test_jax_array_to_dict():
 
 
 # @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-def test_jax_array_join_column():
-    """Test that join_column works correctly with JAX arrays."""
+def test_jax_array_join():
+    """Test that join works correctly with JAX arrays."""
     
     # Create DataFrames with JAX arrays
     df1_data = {
@@ -125,7 +125,7 @@ def test_jax_array_join_column():
     df2 = DataFrame(df2_data, name="df2")
     
     # Join JAX array column
-    result = df1.join_column(df2, on_column='id', source_column='value2')
+    result = df1.join(df2, on='id', source='value2')
     
     # Check that the joined column is properly handled
     assert 'df2/value2' in result.columns, "Joined column should be present"

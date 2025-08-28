@@ -217,8 +217,8 @@ def test_name_attribute():
     assert selected_df.name == "test_df_selected"
 
 
-def test_join_column():
-    """Test the join_column method."""
+def test_join():
+    """Test the join method."""
     # Create first DataFrame (like sample_assay_df)
     df1_data = {
         'sample_id': ['001', '002', '003', '001', '002'],
@@ -233,8 +233,8 @@ def test_join_column():
     }
     df2 = DataFrame(df2_data, name="params")
     
-    # Test basic join
-    result = df1.join_column(df2, on_column='assay_id', source_column='var')
+    # Test basic join (using left join to preserve original row order)
+    result = df1.join(df2, on='assay_id', source='var', how='left')
     
     # Check that new column was added with correct name
     assert 'params/var' in result.columns
@@ -249,22 +249,22 @@ def test_join_column():
     assert list(result['assay_id']) == ['01', '01', '02', '02', '01']
     
     # Test custom target column name
-    result2 = df1.join_column(df2, on_column='assay_id', source_column='var', 
-                             target_column='custom_var')
+    result2 = df1.join(df2, on='assay_id', source='var', 
+                      target='custom_var', how='left')
     assert 'custom_var' in result2.columns
     assert 'params/var' not in result2.columns
     
     # Test with DataFrame without name
     df2_no_name = DataFrame(df2_data)
-    result3 = df1.join_column(df2_no_name, on_column='assay_id', source_column='var')
-    assert 'var' in result3.columns  # Should use source_column name when no name
+    result3 = df1.join(df2_no_name, on='assay_id', source='var', how='left')
+    assert 'var' in result3.columns  # Should use source name when no name
     
     # Test error conditions
     with pytest.raises(KeyError):
-        df1.join_column(df2, on_column='nonexistent', source_column='var')
+        df1.join(df2, on='nonexistent', source='var')
     
     with pytest.raises(KeyError):
-        df1.join_column(df2, on_column='assay_id', source_column='nonexistent')
+        df1.join(df2, on='assay_id', source='nonexistent')
     
     # Test duplicate values in join column
     df2_duplicates = DataFrame({
@@ -272,19 +272,25 @@ def test_join_column():
         'var': [10, 20]
     })
     with pytest.raises(ValueError, match="Duplicate values found"):
-        df1.join_column(df2_duplicates, on_column='assay_id', source_column='var')
+        df1.join(df2_duplicates, on='assay_id', source='var')
     
-    # Test missing value in lookup
+    # Test missing value in lookup - with inner join default, missing keys result in empty result
     df1_missing = DataFrame({
         'sample_id': ['001'],
         'assay_id': ['03']  # Not in df2
     })
-    with pytest.raises(ValueError, match="not found in other DataFrame"):
-        df1_missing.join_column(df2, on_column='assay_id', source_column='var')
+    result_missing = df1_missing.join(df2, on='assay_id', source='var')
+    # With inner join default, missing keys result in empty result (no rows)
+    assert len(result_missing) == 0
+    
+    # Test that left join still produces NaN for missing values
+    result_missing_left = df1_missing.join(df2, on='assay_id', source='var', how='left')
+    assert len(result_missing_left) == 1
+    assert np.isnan(result_missing_left['params/var'][0])
 
 
 def test_join_multiple_columns():
-    """Test the join_column method with multiple columns."""
+    """Test the join method with multiple columns."""
     # Create first DataFrame
     df1_data = {
         'sample_id': ['001', '002', '003'],
@@ -301,9 +307,9 @@ def test_join_multiple_columns():
     }
     df2 = DataFrame(df2_data, name="treatments")
     
-    # Test joining multiple columns with automatic naming
-    result = df1.join_column(df2, on_column='treatment_id', 
-                            source_column=['dose', 'duration', 'category'])
+    # Test joining multiple columns with automatic naming (using left join to preserve order)
+    result = df1.join(df2, on='treatment_id', 
+                     source=['dose', 'duration', 'category'], how='left')
     
     # Check that all new columns were added with correct names
     expected_new_columns = ['treatments/dose', 'treatments/duration', 'treatments/category']
@@ -313,7 +319,7 @@ def test_join_multiple_columns():
     # Check shape
     assert result.shape == (3, 5)  # 2 original + 3 new columns
     
-    # Check values are correctly mapped
+    # Check values are correctly mapped (left join preserves original order)
     expected_dose_values = [10.0, 20.0, 10.0]  # T1->10.0, T2->20.0, T1->10.0
     expected_duration_values = [30, 60, 30]    # T1->30, T2->60, T1->30
     expected_category_values = ['A', 'B', 'A']  # T1->A, T2->B, T1->A
@@ -323,9 +329,9 @@ def test_join_multiple_columns():
     assert list(result['treatments/category']) == expected_category_values
     
     # Test joining multiple columns with custom naming
-    result2 = df1.join_column(df2, on_column='treatment_id',
-                             source_column=['dose', 'duration'],
-                             target_column=['custom_dose', 'custom_duration'])
+    result2 = df1.join(df2, on='treatment_id',
+                      source=['dose', 'duration'],
+                      target=['custom_dose', 'custom_duration'], how='left')
     
     assert 'custom_dose' in result2.columns
     assert 'custom_duration' in result2.columns
@@ -336,16 +342,16 @@ def test_join_multiple_columns():
     assert list(result2['custom_dose']) == expected_dose_values
     assert list(result2['custom_duration']) == expected_duration_values
     
-    # Test error: mismatched target_column length
-    with pytest.raises(ValueError, match="Length of target_column list"):
-        df1.join_column(df2, on_column='treatment_id',
-                       source_column=['dose', 'duration'],
-                       target_column=['only_one_name'])  # Should be 2 names
+    # Test error: mismatched target length
+    with pytest.raises(ValueError, match="Length of target list"):
+        df1.join(df2, on='treatment_id',
+                source=['dose', 'duration'],
+                target=['only_one_name'])  # Should be 2 names
     
     # Test with DataFrame without name (should use source column names)
     df2_no_name = DataFrame(df2_data)
-    result3 = df1.join_column(df2_no_name, on_column='treatment_id',
-                             source_column=['dose', 'duration'])
+    result3 = df1.join(df2_no_name, on='treatment_id',
+                      source=['dose', 'duration'])
     
     assert 'dose' in result3.columns
     assert 'duration' in result3.columns
