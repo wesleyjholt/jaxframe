@@ -130,6 +130,51 @@ def _format_value_for_jit_print(value: Any) -> str:
         return str(value)
 
 
+def _should_quote_value(original_value: Any, formatted_value: str) -> bool:
+    """
+    Determine whether a value should be quoted in the dictionary representation.
+    
+    Args:
+        original_value: The original value from the DataFrame
+        formatted_value: The formatted string representation
+        
+    Returns:
+        True if the value should be quoted, False otherwise
+    """
+    # Don't quote numeric-looking values or tracers
+    if formatted_value in ['<tracer>']:
+        return False
+    
+    # Don't quote if it looks like a tracer format (f32, i32[3], etc.)
+    if any(formatted_value.startswith(dt) for dt in ['f32', 'f64', 'i32', 'i64', 'bool', 'c64', 'c128']):
+        return False
+    
+    # Check the original value type for the most reliable determination
+    if isinstance(original_value, (int, float, bool)):
+        return False
+    
+    # Check if it's a numpy scalar of numeric type
+    if hasattr(original_value, 'dtype'):
+        dtype_str = str(original_value.dtype)
+        if any(dt in dtype_str for dt in ['int', 'float', 'bool']):
+            return False
+    
+    # Don't quote if it's a pure number (but only if original isn't a string)
+    if not isinstance(original_value, str):
+        try:
+            float(formatted_value)
+            return False
+        except (ValueError, TypeError):
+            pass
+    
+    # Don't quote boolean values (if they're actual booleans, not string representations)
+    if isinstance(original_value, bool) or formatted_value.lower() in ['true', 'false']:
+        return False
+    
+    # Quote everything else (strings, etc.)
+    return True
+
+
 def jit_print_dataframe(df: Any) -> None:
     """
     Print a DataFrame representation that works within jax.jit.
@@ -172,15 +217,21 @@ def jit_print_dataframe(df: Any) -> None:
     max_display_rows = min(df._length, 5)
     
     for i in range(max_display_rows):
-        row_data = []
+        row_pairs = []
         for col in df._columns:
             value = df._data[col][i]
             # Format the value nicely, handling JAX tracers
             formatted_value = _format_value_for_jit_print(value)
-            row_data.append(formatted_value)
+            
+            # Determine if we need quotes around the value
+            # Only add quotes for string values, not for numeric values or tracers
+            if _should_quote_value(value, formatted_value):
+                row_pairs.append(f"'{col}': '{formatted_value}'")
+            else:
+                row_pairs.append(f"'{col}': {formatted_value}")
         
         # Create the row representation
-        row_dict_str = ", ".join([f"'{col}': '{val}'" for col, val in zip(df._columns, row_data)])
+        row_dict_str = ", ".join(row_pairs)
         jax.debug.print("  [{}]: {{{}}}", i, row_dict_str)
     
     # Show continuation if there are more rows
@@ -261,14 +312,19 @@ def jit_print_dataframe_data(data: Dict[str, Any], columns: List[str], length: i
     max_display_rows = min(length, 5)
     
     for i in range(max_display_rows):
-        row_values = []
+        row_pairs = []
         for col in columns:
             value = data[col][i]
             # Format values using our helper function
             formatted_value = _format_value_for_jit_print(value)
-            row_values.append(formatted_value)
+            
+            # Apply same quoting logic as main DataFrame function
+            if _should_quote_value(value, formatted_value):
+                row_pairs.append(f"'{col}': '{formatted_value}'")
+            else:
+                row_pairs.append(f"'{col}': {formatted_value}")
         
-        row_dict_str = ", ".join([f"'{col}': '{val}'" for col, val in zip(columns, row_values)])
+        row_dict_str = ", ".join(row_pairs)
         jax.debug.print("  [{}]: {{{}}}", i, row_dict_str)
     
     if length > max_display_rows:

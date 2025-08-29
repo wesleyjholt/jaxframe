@@ -329,3 +329,95 @@ class TestTracerFormatting:
         normal_value = 3.14159
         formatted_normal = _format_value_for_jit_print(normal_value)
         assert formatted_normal == "3.142", f"Expected '3.142', got '{formatted_normal}'"
+
+
+class TestCleanFormatting:
+    """Test the clean formatting without unnecessary quotes."""
+    
+    def test_should_quote_value_function(self):
+        """Test the _should_quote_value helper function."""
+        from jaxframe.jitprint import _should_quote_value
+        
+        # Test numeric values - should not be quoted
+        assert not _should_quote_value(42, "42")
+        assert not _should_quote_value(3.14, "3.140")
+        assert not _should_quote_value(0, "0")
+        
+        # Test boolean values - should not be quoted
+        assert not _should_quote_value(True, "True")
+        assert not _should_quote_value(False, "False")
+        
+        # Test string values - should be quoted
+        assert _should_quote_value("hello", "hello")
+        assert _should_quote_value("0057", "0057")  # String that looks like number
+        
+        # Test tracers - should not be quoted
+        assert not _should_quote_value("dummy", "f32")
+        assert not _should_quote_value("dummy", "i32[3]")
+        assert not _should_quote_value("dummy", "<tracer>")
+        
+        # Test numpy scalars
+        import numpy as np
+        assert not _should_quote_value(np.float32(1.5), "1.500")
+        assert not _should_quote_value(np.int32(10), "10")
+    
+    def test_dataframe_clean_output_format(self):
+        """Test that DataFrame output has clean formatting."""
+        df = DataFrame({
+            'numeric': [1.5, 2.5],
+            'integer': [10, 20],
+            'boolean': [True, False],
+            'string': ['ABC', 'DEF']
+        })
+        
+        def test_clean_format(static_df):
+            # This would previously show quotes around all values
+            # Now should only quote strings
+            jit_print_dataframe(static_df)
+            return jnp.array([1.0])
+        
+        jitted = jax.jit(test_clean_format, static_argnames=['static_df'])
+        result = jitted(static_df=df)
+        
+        # The test passes if no errors are thrown and formatting works
+        assert result[0] == 1.0
+    
+    def test_dataframe_data_clean_output_format(self):
+        """Test that jit_print_dataframe_data has clean formatting."""
+        @jax.jit
+        def test_data_clean_format():
+            data = {
+                'floats': jnp.array([1.1, 2.2]),
+                'ints': jnp.array([5, 10]),
+                'bools': jnp.array([True, False])
+            }
+            columns = ['floats', 'ints', 'bools']
+            
+            # Should show clean tracer formatting without unnecessary quotes
+            jit_print_dataframe_data(data, columns, 2, "test")
+            return jnp.array([42.0])
+        
+        result = test_data_clean_format()
+        assert result[0] == 42.0
+    
+    def test_mixed_types_clean_formatting(self):
+        """Test clean formatting with mixed data types including tracers."""
+        df = DataFrame({
+            'base_num': [1.0, 2.0],
+            'base_str': ['X', 'Y']
+        })
+        
+        def add_tracers(params, static_df):
+            # Add JAX tracers to the DataFrame
+            new_df = static_df.add_column('tracer_col', params)
+            jit_print_dataframe(new_df)
+            return jnp.sum(params)
+        
+        grad_fn = jax.grad(add_tracers)
+        jitted = jax.jit(grad_fn, static_argnames=['static_df'])
+        
+        test_params = jnp.array([3.0, 4.0])
+        result = jitted(test_params, df)
+        
+        # Should work without errors and show clean formatting
+        np.testing.assert_allclose(result, [1.0, 1.0])
