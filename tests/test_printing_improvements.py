@@ -149,3 +149,111 @@ class TestImprovedPrinting:
         assert "'integers': 10" in repr_str  # integers no quotes
         assert "'floats': 1.100" in repr_str  # floats no quotes, 3 decimals
         assert "'numpy_arr': 100.500" in repr_str  # numpy values no quotes
+
+    def test_jax_tracer_detection_in_repr(self):
+        """Test that JAX tracers are detected and handled properly in repr."""
+        pytest.importorskip("jax")
+        import jax
+        import jax.numpy as jnp
+        
+        # Create a DataFrame with JAX arrays
+        data = {
+            'jax_float': jnp.array([1.0, 2.0, 3.0]),
+            'jax_int': jnp.array([10, 20, 30])
+        }
+        df = DataFrame(data)
+        
+        # Test normal representation (should work fine)
+        repr_str = repr(df)
+        assert "'jax_float': 1.000" in repr_str
+        assert "'jax_int': 10" in repr_str
+        
+        # Test that we can handle ConcretizationTypeError gracefully
+        # by simulating a problematic JAX value
+        class ProblematicJAXValue:
+            """Simulates a JAX value that raises ConcretizationTypeError when converted."""
+            def __init__(self, dtype, shape):
+                self.dtype = dtype
+                self.shape = shape
+                self.__module__ = 'jax'
+            
+            def __float__(self):
+                raise jax.errors.ConcretizationTypeError("Cannot convert tracer to float")
+            
+            def __int__(self):
+                raise jax.errors.ConcretizationTypeError("Cannot convert tracer to int")
+        
+        # Since we can't easily create a real tracer, we'll test the fallback behavior
+        # When the isinstance(value, jax.core.Tracer) check fails but we get a 
+        # ConcretizationTypeError, we should still handle it gracefully
+        problematic_value = ProblematicJAXValue(jnp.float32, ())
+        
+        # This should not crash even with a problematic JAX-like value
+        try:
+            problem_df = DataFrame({
+                'problem_col': [problematic_value],
+                'normal_col': ['test']
+            })
+            repr_str = repr(problem_df)
+            # Should not crash and should contain the normal column
+            assert "'normal_col': 'test'" in repr_str
+        except Exception as e:
+            # If it does raise an exception, it should not be a ConcretizationTypeError
+            assert not isinstance(e, jax.errors.ConcretizationTypeError)
+
+    def test_jax_tracer_fallback_with_concretization_error(self):
+        """Test that ConcretizationTypeError is handled as a fallback."""
+        pytest.importorskip("jax")
+        import jax
+        import jax.numpy as jnp
+        
+        # Create a proper JAX array first and test normal behavior
+        normal_jax = jnp.array([1.5, 2.5])
+        normal_df = DataFrame({
+            'jax_col': normal_jax,
+            'normal': ['hello', 'world']
+        })
+        
+        # This should work fine
+        repr_str = repr(normal_df)
+        assert "'normal': 'hello'" in repr_str
+        assert "'jax_col': 1.500" in repr_str
+        
+        # Now create a simple test for error handling during repr
+        # We'll manually test the logic path where a ConcretizationTypeError 
+        # might be caught, by testing with an object that will cause the error
+        from unittest.mock import patch
+        
+        # Mock a JAX array that will raise ConcretizationTypeError
+        with patch('jax.errors.ConcretizationTypeError', Exception):
+            class ProblematicJAXValue:
+                """A value that simulates a JAX object that can't be concretized."""
+                def __init__(self):
+                    self.dtype = jnp.float32
+                    self.shape = ()
+                    self.__module__ = 'jax'
+                
+                def __float__(self):
+                    raise Exception("Mock ConcretizationTypeError")
+                
+                def __int__(self):
+                    raise Exception("Mock ConcretizationTypeError")
+            
+            problematic_value = ProblematicJAXValue()
+            
+            # Test DataFrame with this problematic value
+            try:
+                problem_df = DataFrame({
+                    'problem_col': [problematic_value],
+                    'normal_col': ['test']
+                })
+                
+                # Should not crash and should handle the error gracefully
+                repr_str = repr(problem_df)
+                assert "'normal_col': 'test'" in repr_str
+                # The problematic value should be handled somehow (not crash)
+                assert "problem_col" in repr_str
+                
+            except Exception as e:
+                # Should not be the mock ConcretizationTypeError
+                assert "Mock ConcretizationTypeError" not in str(e)

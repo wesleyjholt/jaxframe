@@ -249,15 +249,30 @@ class DataFrame:
                             # Check if it's a JAX array/scalar
                             try:
                                 import jax
+                                import jax.core
                                 if hasattr(value, 'dtype') and (
                                     str(type(value)).startswith('<class \'jaxlib.') or
-                                    str(type(value).__module__).startswith('jax')):
-                                    # Extract the underlying value from JAX array/scalar
-                                    scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
-                                    if isinstance(scalar_value, float):
-                                        row_dict[col] = f"{scalar_value:.3f}"
+                                    str(type(value).__module__).startswith('jax') or
+                                    (hasattr(value, '__module__') and str(value.__module__).startswith('jax'))):
+                                    # Check if this is a tracer (from jit, grad, etc.)
+                                    if isinstance(value, jax.core.Tracer):
+                                        # Display tracer info instead of trying to extract value
+                                        dtype_str = str(value.dtype) if hasattr(value, 'dtype') else 'unknown'
+                                        shape_str = str(value.shape) if hasattr(value, 'shape') else '[]'
+                                        row_dict[col] = f"<JAX tracer {dtype_str}{shape_str}>"
                                     else:
-                                        row_dict[col] = str(scalar_value)
+                                        try:
+                                            # Extract the underlying value from JAX array/scalar
+                                            scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
+                                            if isinstance(scalar_value, float):
+                                                row_dict[col] = f"{scalar_value:.3f}"
+                                            else:
+                                                row_dict[col] = str(scalar_value)
+                                        except jax.errors.ConcretizationTypeError:
+                                            # Fallback for any JAX value that can't be concretized
+                                            dtype_str = str(value.dtype) if hasattr(value, 'dtype') else 'unknown'
+                                            shape_str = str(value.shape) if hasattr(value, 'shape') else '[]'
+                                            row_dict[col] = f"<JAX value {dtype_str}{shape_str}>"
                                 else:
                                     # For strings and other non-JAX types, keep quotes
                                     row_dict[col] = repr(value)
@@ -268,15 +283,30 @@ class DataFrame:
                         # Numpy not available, check JAX only
                         try:
                             import jax
+                            import jax.core
                             if hasattr(value, 'dtype') and (
                                 str(type(value)).startswith('<class \'jaxlib.') or
-                                str(type(value).__module__).startswith('jax')):
-                                # Extract the underlying value from JAX array/scalar
-                                scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
-                                if isinstance(scalar_value, float):
-                                    row_dict[col] = f"{scalar_value:.3f}"
+                                str(type(value).__module__).startswith('jax') or
+                                (hasattr(value, '__module__') and str(value.__module__).startswith('jax'))):
+                                # Check if this is a tracer (from jit, grad, etc.)
+                                if isinstance(value, jax.core.Tracer):
+                                    # Display tracer info instead of trying to extract value
+                                    dtype_str = str(value.dtype) if hasattr(value, 'dtype') else 'unknown'
+                                    shape_str = str(value.shape) if hasattr(value, 'shape') else '[]'
+                                    row_dict[col] = f"<JAX tracer {dtype_str}{shape_str}>"
                                 else:
-                                    row_dict[col] = str(scalar_value)
+                                    try:
+                                        # Extract the underlying value from JAX array/scalar
+                                        scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
+                                        if isinstance(scalar_value, float):
+                                            row_dict[col] = f"{scalar_value:.3f}"
+                                        else:
+                                            row_dict[col] = str(scalar_value)
+                                    except jax.errors.ConcretizationTypeError:
+                                        # Fallback for any JAX value that can't be concretized
+                                        dtype_str = str(value.dtype) if hasattr(value, 'dtype') else 'unknown'
+                                        shape_str = str(value.shape) if hasattr(value, 'shape') else '[]'
+                                        row_dict[col] = f"<JAX value {dtype_str}{shape_str}>"
                             else:
                                 # For strings and other types, keep quotes
                                 row_dict[col] = repr(value)
