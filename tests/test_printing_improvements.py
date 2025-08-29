@@ -94,6 +94,73 @@ class TestImprovedPrinting:
         assert "'jax_int': 100" in repr_str
         assert "'jax_float': 1.230" in repr_str
     
+    def test_jax_tracer_safe_printing(self):
+        """Test that DataFrame printing works safely with JAX tracers."""
+        try:
+            import jax
+            import jax.numpy as jnp
+            
+            @jax.jit
+            def test_printing_with_tracers(x):
+                # Create DataFrame with tracers - this should not fail
+                data = {
+                    'traced_values': x,
+                    'computed': x * 2.0,
+                    'strings': ['a', 'b', 'c']
+                }
+                df = DataFrame(data)
+                
+                # These operations should not raise ConcretizationTypeError
+                repr_str = repr(df)
+                dtypes = df.dtypes()
+                
+                # Check that tracers are detected and handled properly
+                assert '<jax_tracer>' in str(dtypes.values())
+                assert '<f32>' in repr_str
+                
+                return x
+            
+            # Test with JAX array (becomes tracer inside JIT)
+            test_array = jnp.array([1.0, 2.0, 3.0])
+            result = test_printing_with_tracers(test_array)
+            
+            # Test passed if we get here without ConcretizationTypeError
+            assert jnp.array_equal(result, test_array)
+            
+        except ImportError:
+            pytest.skip("JAX not available")
+    
+    def test_tracer_detection_methods(self):
+        """Test the internal tracer detection methods."""
+        data = {
+            'normal_int': [1, 2, 3],
+            'normal_str': ['a', 'b', 'c']
+        }
+        df = DataFrame(data)
+        
+        # Test that normal values are not detected as tracers
+        assert not df._contains_jax_tracers()
+        assert not df._is_jax_tracer(42)
+        assert not df._is_jax_tracer('hello')
+        assert not df._is_jax_tracer(3.14)
+        
+        # Test safe formatting
+        assert df._format_value_safe(42) == '42'
+        assert df._format_value_safe(3.14159) == '3.142'
+        assert df._format_value_safe('hello') == "'hello'"
+    
+    def test_pprint_method(self):
+        """Test the pprint method."""
+        data = {'col1': [1, 2], 'col2': ['a', 'b']}
+        df = DataFrame(data)
+        
+        # Test that pprint method exists and can be called
+        # We can't easily test the output, but we can ensure it doesn't crash
+        try:
+            df.pprint()  # This should print to stdout
+        except Exception as e:
+            pytest.fail(f"pprint() method failed: {e}")
+    
     def test_empty_dataframe_repr(self):
         """Test repr for empty DataFrame."""
         df = DataFrame({'col1': [], 'col2': []})

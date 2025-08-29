@@ -150,7 +150,10 @@ class DataFrame:
         """Get detailed data types for each column."""
         dtypes = {}
         for col_name, col_data in self._data.items():
-            if hasattr(col_data, 'dtype'):
+            # Check if any value in the column is a JAX tracer
+            if self._contains_jax_tracers():
+                dtypes[col_name] = "<jax_tracer>"
+            elif hasattr(col_data, 'dtype'):
                 # For numpy arrays or JAX arrays
                 dtypes[col_name] = str(col_data.dtype)
             elif isinstance(col_data, list) and len(col_data) > 0:
@@ -162,6 +165,153 @@ class DataFrame:
                 # Fallback
                 dtypes[col_name] = type(col_data).__name__
         return dtypes
+    
+    def _contains_jax_tracers(self) -> bool:
+        """Check if the DataFrame contains any JAX tracers."""
+        for col_data in self._data.values():
+            if isinstance(col_data, list):
+                for value in col_data:
+                    if self._is_jax_tracer(value):
+                        return True
+            else:
+                # For arrays, check a sample of values
+                try:
+                    for i in range(min(5, len(col_data))):  # Check first 5 values
+                        if self._is_jax_tracer(col_data[i]):
+                            return True
+                except:
+                    # If we can't iterate, check the whole array
+                    if self._is_jax_tracer(col_data):
+                        return True
+        return False
+    
+    def _is_jax_tracer(self, value) -> bool:
+        """Check if a value is a JAX tracer using multiple detection strategies."""
+        try:
+            # Strategy 1: Check type name for tracer indicators
+            type_str = str(type(value))
+            if any(keyword in type_str for keyword in ['Traced', 'Tracer', 'JVP', 'Jaxpr']):
+                return True
+            
+            # Strategy 2: Check for tracer-specific attributes
+            if hasattr(value, 'aval') or hasattr(value, 'primal') or hasattr(value, '_aval'):
+                return True
+            
+            # Strategy 3: Check string representation for complex tracers
+            str_repr = str(value)
+            if len(str_repr) > 100 and any(keyword in str_repr for keyword in ['Traced<', 'JVPTrace', 'JaxprTrace']):
+                return True
+                
+            # Strategy 4: Try to detect if conversion to concrete value would fail
+            # This is a more conservative check - if we can't convert to float/int safely, it might be a tracer
+            if hasattr(value, 'dtype'):
+                try:
+                    # Try a safe operation that would fail on tracers
+                    _ = bool(value.shape == ())  # This should work for regular arrays but might fail for tracers
+                except:
+                    return True
+                    
+        except Exception:
+            # If any of our detection methods fail, err on the side of caution
+            return True
+            
+        return False
+    
+    def _format_value_safe(self, value) -> str:
+        """Format a value safely, handling JAX tracers."""
+        if self._is_jax_tracer(value):
+            return self._format_jax_tracer(value)
+        
+        # Regular formatting for non-tracers
+        if isinstance(value, (int, float)):
+            if isinstance(value, float):
+                return f"{value:.3f}"
+            else:
+                return str(value)
+        else:
+            # Check if it's a numpy scalar
+            try:
+                import numpy as np
+                if isinstance(value, np.integer):
+                    return str(int(value))
+                elif isinstance(value, np.floating):
+                    return f"{float(value):.3f}"
+            except ImportError:
+                pass
+            
+            # For strings and other types
+            return repr(value)
+    
+    def _format_jax_tracer(self, value) -> str:
+        """Format a JAX tracer value to show clean output like 'f32' or 'f32[3]'."""
+        try:
+            # Try to extract dtype and shape information
+            aval = None
+            
+            # Multiple strategies to get aval information
+            if hasattr(value, 'aval'):
+                aval = value.aval
+            elif hasattr(value, 'primal') and hasattr(value.primal, 'aval'):
+                aval = value.primal.aval
+            elif hasattr(value, '_aval'):
+                aval = value._aval
+            elif hasattr(value, 'shape') and hasattr(value, 'dtype'):
+                # Create a mock aval object
+                class MockAval:
+                    def __init__(self, shape, dtype):
+                        self.shape = shape
+                        self.dtype = dtype
+                aval = MockAval(value.shape, value.dtype)
+            
+            if aval is not None:
+                # Clean up dtype strings
+                dtype_str = str(aval.dtype)
+                dtype_map = {
+                    'float32': 'f32', 'float64': 'f64',
+                    'int32': 'i32', 'int64': 'i64', 
+                    'bool': 'bool', 'complex64': 'c64', 'complex128': 'c128'
+                }
+                dtype_str = dtype_map.get(dtype_str, dtype_str)
+                
+                if aval.shape == ():
+                    return f"<{dtype_str}>"  # scalar tracer
+                else:
+                    shape_str = 'x'.join(map(str, aval.shape))
+                    return f"<{dtype_str}[{shape_str}]>"  # array tracer
+        except Exception:
+            pass
+        
+        # Fallback
+        return "<jax_tracer>"
+    
+    def _should_quote_value_safe(self, original_value, formatted_value) -> bool:
+        """Determine if a value should be quoted, considering JAX tracers."""
+        # Don't quote tracer representations
+        if formatted_value.startswith('<') and formatted_value.endswith('>'):
+            return False
+        
+        # Don't quote numeric values
+        if isinstance(original_value, (int, float, bool)):
+            return False
+        
+        # Check if it's a numpy scalar of numeric type
+        try:
+            import numpy as np
+            if isinstance(original_value, (np.integer, np.floating, np.bool_)):
+                return False
+        except ImportError:
+            pass
+        
+        # Don't quote if it looks like a number (but only if original isn't a string)
+        if not isinstance(original_value, str):
+            try:
+                float(formatted_value)
+                return False
+            except (ValueError, TypeError):
+                pass
+        
+        # Quote everything else (strings, etc.)
+        return True
     
     def __len__(self) -> int:
         """Get the number of rows in the DataFrame."""
@@ -231,58 +381,14 @@ class DataFrame:
             row_dict = {}
             for col in self._columns:
                 value = self._data[col][i]
-                # Format the value without quotes for numeric types
-                if isinstance(value, (int, float)):
-                    if isinstance(value, float):
-                        row_dict[col] = f"{value:.3f}"
-                    else:
-                        row_dict[col] = str(value)
+                # Use safe formatting that handles JAX tracers
+                formatted_value = self._format_value_safe(value)
+                
+                # Determine if we should quote the value
+                if self._should_quote_value_safe(value, formatted_value):
+                    row_dict[col] = formatted_value  # formatted_value already includes quotes from repr()
                 else:
-                    # Check if it's a numpy scalar
-                    try:
-                        import numpy as np
-                        if isinstance(value, np.integer):
-                            row_dict[col] = str(int(value))
-                        elif isinstance(value, np.floating):
-                            row_dict[col] = f"{float(value):.3f}"
-                        else:
-                            # Check if it's a JAX array/scalar
-                            try:
-                                import jax
-                                if hasattr(value, 'dtype') and (
-                                    str(type(value)).startswith('<class \'jaxlib.') or
-                                    str(type(value).__module__).startswith('jax')):
-                                    # Extract the underlying value from JAX array/scalar
-                                    scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
-                                    if isinstance(scalar_value, float):
-                                        row_dict[col] = f"{scalar_value:.3f}"
-                                    else:
-                                        row_dict[col] = str(scalar_value)
-                                else:
-                                    # For strings and other non-JAX types, keep quotes
-                                    row_dict[col] = repr(value)
-                            except ImportError:
-                                # JAX not available, treat as regular value
-                                row_dict[col] = repr(value)
-                    except ImportError:
-                        # Numpy not available, check JAX only
-                        try:
-                            import jax
-                            if hasattr(value, 'dtype') and (
-                                str(type(value)).startswith('<class \'jaxlib.') or
-                                str(type(value).__module__).startswith('jax')):
-                                # Extract the underlying value from JAX array/scalar
-                                scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
-                                if isinstance(scalar_value, float):
-                                    row_dict[col] = f"{scalar_value:.3f}"
-                                else:
-                                    row_dict[col] = str(scalar_value)
-                            else:
-                                # For strings and other types, keep quotes
-                                row_dict[col] = repr(value)
-                        except ImportError:
-                            # Neither numpy nor JAX available
-                            row_dict[col] = repr(value)
+                    row_dict[col] = formatted_value
             
             # Manually format the dictionary to control quote display
             items = []
@@ -294,6 +400,10 @@ class DataFrame:
             lines.append(f"  ... ({self._length - max_display_rows} more rows)")
         
         return "\n".join(lines)
+    
+    def pprint(self) -> None:
+        """Pretty print the DataFrame, safely handling JAX tracers."""
+        print(self.__repr__())
     
     def __eq__(self, other) -> bool:
         """Check equality with another DataFrame."""
