@@ -13,29 +13,64 @@ from typing import Any, Dict, List, Union
 
 def _format_value_for_jit_print(value: Any) -> str:
     """
-    Format a value for JIT-compatible printing, handling JAX tracers elegantly.
+    Format a value for JIT printing, handling JAX tracers nicely.
+    
+    For JAX tracers, this extracts the dtype and shape to show clean output
+    like 'f32[3]' instead of ugly tracer representations.
     
     Args:
-        value: The value to format
+        value: The value to format (could be a tracer, array, scalar, etc.)
         
     Returns:
-        A string representation suitable for JIT printing
+        A clean string representation of the value
     """
-    # Check if it's a JAX tracer by looking for common tracer attributes
-    if hasattr(value, 'aval') and hasattr(value, 'shape') and hasattr(value, 'dtype'):
-        # It's likely a JAX tracer - format it like equinox does
-        dtype_str = str(value.dtype)
-        # Convert numpy.float32 -> f32, numpy.int32 -> i32, etc.
-        if dtype_str.startswith('float'):
-            dtype_str = 'f' + dtype_str[5:]  # float32 -> f32
-        elif dtype_str.startswith('int'):
-            dtype_str = 'i' + dtype_str[3:]   # int32 -> i32
-        elif dtype_str.startswith('bool'):
-            dtype_str = 'bool'
-        elif dtype_str.startswith('complex'):
-            dtype_str = 'c' + dtype_str[7:]   # complex64 -> c64
+    # Handle complex JAX tracers (JVP, Batched, etc.) - look for nested structure
+    if hasattr(value, '__class__') and 'Traced' in str(type(value)):
+        # Try to extract aval from complex tracers
+        aval = None
+        if hasattr(value, 'aval'):
+            aval = value.aval
+        elif hasattr(value, 'primal') and hasattr(value.primal, 'aval'):
+            aval = value.primal.aval
+        elif hasattr(value, 'primal') and hasattr(value.primal, 'shape') and hasattr(value.primal, 'dtype'):
+            # Create a mock aval-like object
+            class MockAval:
+                def __init__(self, shape, dtype):
+                    self.shape = shape
+                    self.dtype = dtype
+            aval = MockAval(value.primal.shape, value.primal.dtype)
         
-        # Format shape
+        if aval is not None:
+            # Extract clean dtype and shape info from aval
+            dtype_str = str(aval.dtype)
+            
+            # Clean up dtype strings (e.g., 'float32' -> 'f32')
+            dtype_map = {
+                'float32': 'f32', 'float64': 'f64',
+                'int32': 'i32', 'int64': 'i64', 
+                'bool': 'bool', 'complex64': 'c64', 'complex128': 'c128'
+            }
+            dtype_str = dtype_map.get(dtype_str, dtype_str)
+            
+            if aval.shape == ():
+                return dtype_str  # scalar
+            else:
+                shape_str = 'x'.join(map(str, aval.shape))
+                return f"{dtype_str}[{shape_str}]"
+    
+    # Check if this looks like a basic JAX tracer
+    if hasattr(value, 'aval') and hasattr(value, 'shape') and hasattr(value, 'dtype'):
+        # Extract clean dtype and shape info
+        dtype_str = str(value.dtype)
+        
+        # Clean up dtype strings (e.g., 'float32' -> 'f32')
+        dtype_map = {
+            'float32': 'f32', 'float64': 'f64',
+            'int32': 'i32', 'int64': 'i64',
+            'bool': 'bool', 'complex64': 'c64', 'complex128': 'c128'
+        }
+        dtype_str = dtype_map.get(dtype_str, dtype_str)
+        
         if value.shape == ():
             return dtype_str  # scalar
         else:

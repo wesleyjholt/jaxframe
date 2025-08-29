@@ -249,3 +249,47 @@ class TestTracerFormatting:
         # This demonstrates the improvement - manual verification via output
         result = compare_formats()
         assert result.shape == (3,)
+    
+    def test_complex_jvp_tracers(self):
+        """Test that complex JVP tracers from jax.grad are formatted cleanly."""
+        df = DataFrame({'x': [1.0, 2.0], 'y': [3.0, 4.0]})
+        
+        def test_function(params, static_df):
+            # This will create JVP tracers when called through jax.grad
+            result = jnp.sum(params ** 2)
+            
+            # Add the JVP tracers to the DataFrame
+            new_df = static_df.add_column('gradients', params)
+            jit_print_dataframe(new_df)
+            
+            return result
+        
+        # Create a gradient function (this creates JVP tracers)
+        grad_fn = jax.grad(test_function)
+        grad_fn = jax.jit(grad_fn, static_argnames=['static_df'])
+        
+        # This should not crash and should show clean tracer formatting
+        test_params = jnp.array([1.0, 2.0])
+        result = grad_fn(test_params, df)
+        
+        # Verify the gradient is correct
+        expected = 2 * test_params  # gradient of sum(x^2) is 2*x
+        np.testing.assert_allclose(result, expected)
+    
+    def test_nested_complex_tracers(self):
+        """Test even more complex nested tracers."""
+        @jax.jit 
+        def test_nested():
+            # Create some complex nested operations that generate complex tracers
+            x = jnp.array([1.0, 2.0, 3.0])
+            y = jnp.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+            
+            # Operations that might create complex tracer hierarchies
+            z = jnp.sum(x[:, None] * y, axis=0)
+            
+            jax.debug.print("Complex operation result format: {}", _format_value_for_jit_print(z))
+            
+            return z
+        
+        result = test_nested()
+        assert result.shape == (2,)
