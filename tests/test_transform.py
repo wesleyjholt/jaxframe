@@ -5,7 +5,7 @@ Test cases for the transform module functionality.
 import pytest
 import numpy as np
 from jaxframe import DataFrame, wide_to_long_masked, long_to_wide_masked
-from jaxframe import wide_df_to_jax_arrays, jax_arrays_to_wide_df, roundtrip_wide_jax_conversion
+from jaxframe import wide_df_to_masked_array, masked_array_to_wide_df, roundtrip_wide_jax_conversion, MaskedArray
 
 # Skip JAX tests if JAX is not available
 try:
@@ -341,8 +341,8 @@ def test_wide_to_long_real_example():
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")
-def test_wide_df_to_jax_arrays():
-    """Test converting wide DataFrame to JAX arrays."""
+def test_wide_df_to_masked_array():
+    """Test converting wide DataFrame to MaskedArray."""
     import jax.numpy as jnp
     
     # Create test wide DataFrame
@@ -357,14 +357,18 @@ def test_wide_df_to_jax_arrays():
     }
     wide_df = DataFrame(wide_data)
     
-    # Convert to JAX arrays
-    values, masks, id_df = wide_df_to_jax_arrays(wide_df, 'sample_id')
+    # Convert to MaskedArray
+    masked_array = wide_df_to_masked_array(wide_df, 'sample_id')
+    
+    # Check that it's a MaskedArray instance
+    assert isinstance(masked_array, MaskedArray)
     
     # Check shapes
-    assert values.shape == (3, 3)  # 3 rows, 3 variables
-    assert masks.shape == (3, 3)
-    assert len(id_df) == 3
-    assert id_df.columns == ('sample_id',)
+    assert masked_array.shape == (3, 3)  # 3 rows, 3 variables
+    assert masked_array.data.shape == (3, 3)
+    assert masked_array.mask.shape == (3, 3)
+    assert len(masked_array.index_df) == 3
+    assert masked_array.index_df.columns == ('sample_id',)
     
     # Check values (should be sorted by variable index)
     expected_values = jnp.array([
@@ -372,7 +376,7 @@ def test_wide_df_to_jax_arrays():
         [4.0, 5.0, 6.0],  # Row B  
         [7.0, 8.0, 9.0]   # Row C
     ])
-    assert jnp.allclose(values, expected_values)
+    assert jnp.allclose(masked_array.data, expected_values)
     
     # Check masks
     expected_masks = jnp.array([
@@ -380,17 +384,18 @@ def test_wide_df_to_jax_arrays():
         [True, False, True],   # Row B
         [False, True, True]    # Row C
     ])
-    assert jnp.array_equal(masks, expected_masks)
+    assert jnp.array_equal(masked_array.mask, expected_masks)
     
     # Check ID DataFrame
-    id_dict = id_df.to_dict()
+    id_dict = masked_array.index_df.to_dict()
     assert id_dict['sample_id'] == ['A', 'B', 'C']
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")
-def test_jax_arrays_to_wide_df():
-    """Test converting JAX arrays back to wide DataFrame."""
+def test_masked_array_to_wide_df():
+    """Test converting MaskedArray back to wide DataFrame."""
     import jax.numpy as jnp
+    import numpy as np
     
     # Create test arrays
     values = jnp.array([
@@ -398,7 +403,7 @@ def test_jax_arrays_to_wide_df():
         [4.0, 5.0, 6.0],
         [7.0, 8.0, 9.0]
     ])
-    masks = jnp.array([
+    masks = np.array([
         [True, True, False],
         [True, False, True], 
         [False, True, True]
@@ -408,8 +413,11 @@ def test_jax_arrays_to_wide_df():
     id_data = {'sample_id': ['A', 'B', 'C']}
     id_df = DataFrame(id_data)
     
+    # Create MaskedArray
+    masked_array = MaskedArray(data=values, mask=masks, index_df=id_df)
+    
     # Convert to wide DataFrame
-    wide_df = jax_arrays_to_wide_df(values, masks, id_df)
+    wide_df = masked_array_to_wide_df(masked_array)
     
     # Check structure
     expected_columns = [
@@ -429,13 +437,15 @@ def test_jax_arrays_to_wide_df():
     assert jnp.array_equal(wide_dict['var$0$value'], jnp.array([1.0, 4.0, 7.0]))
     assert jnp.array_equal(wide_dict['var$1$value'], jnp.array([2.0, 5.0, 8.0]))
     assert jnp.array_equal(wide_dict['var$2$value'], jnp.array([3.0, 6.0, 9.0]))
-    assert jnp.array_equal(wide_dict['var$0$mask'], jnp.array([True, True, False]))
-    assert jnp.array_equal(wide_dict['var$1$mask'], jnp.array([True, False, True]))
-    assert jnp.array_equal(wide_dict['var$2$mask'], jnp.array([False, True, True]))
     
-    # Check that the columns are indeed JAX arrays
+    # Check numpy array masks using np.array_equal
+    assert np.array_equal(wide_dict['var$0$mask'], np.array([True, True, False]))
+    assert np.array_equal(wide_dict['var$1$mask'], np.array([True, False, True]))
+    assert np.array_equal(wide_dict['var$2$mask'], np.array([False, True, True]))
+    
+    # Check that values are JAX arrays and masks are numpy arrays
     assert wide_df.column_types['var$0$value'] == 'jax_array'
-    assert wide_df.column_types['var$0$mask'] == 'jax_array'
+    assert wide_df.column_types['var$0$mask'] == 'array'
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")
@@ -491,7 +501,7 @@ def test_roundtrip_wide_jax_conversion():
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available") 
-def test_wide_df_to_jax_arrays_missing_masks():
+def test_wide_df_to_masked_array_missing_masks():
     """Test conversion when some mask columns are missing."""
     import jax.numpy as jnp
     
@@ -505,15 +515,15 @@ def test_wide_df_to_jax_arrays_missing_masks():
     }
     wide_df = DataFrame(wide_data)
     
-    # Convert to JAX arrays
-    values, masks, id_df = wide_df_to_jax_arrays(wide_df, 'sample_id')
+    # Convert to MaskedArray
+    masked_array = wide_df_to_masked_array(wide_df, 'sample_id')
     
     # Check that missing masks default to True
     expected_masks = jnp.array([
         [True, True],   # A: var$0 has mask=True, var$1 defaults to True
         [False, True]   # B: var$0 has mask=False, var$1 defaults to True  
     ])
-    assert jnp.array_equal(masks, expected_masks)
+    assert jnp.array_equal(masked_array.mask, expected_masks)
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")
@@ -534,11 +544,11 @@ def test_jax_computational_graph_preservation():
         }
         df = DataFrame(wide_data)
         
-        # Convert to JAX arrays
-        values, masks, id_df = wide_df_to_jax_arrays(df, ['sample_id'])
+        # Convert to MaskedArray
+        masked_array = wide_df_to_masked_array(df, ['sample_id'])
         
         # Convert back to wide DataFrame
-        reconstructed_df = jax_arrays_to_wide_df(values, masks, id_df, 'var')
+        reconstructed_df = masked_array_to_wide_df(masked_array, 'var')
         
         # Get values and compute a loss
         val0 = reconstructed_df['var$0$value']
@@ -567,19 +577,21 @@ def test_jax_computational_graph_preservation():
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")
-def test_jax_arrays_remain_jax_arrays():
-    """Test that JAX arrays in reconstructed DataFrame are still JAX arrays."""
+def test_jax_values_numpy_masks_preserved():
+    """Test that values remain JAX arrays and masks remain numpy arrays."""
     import jax.numpy as jnp
+    import numpy as np
     
     # Create input arrays
     values = jnp.array([[1.0, 2.0], [3.0, 4.0]])
-    masks = jnp.array([[True, True], [False, True]])
+    masks = np.array([[True, True], [False, True]])  # Use numpy for masks
     id_df = DataFrame({'sample_id': ['A', 'B']})
     
-    # Convert to DataFrame
-    wide_df = jax_arrays_to_wide_df(values, masks, id_df, 'test')
+    # Create MaskedArray and convert to DataFrame
+    masked_array = MaskedArray(data=values, mask=masks, index_df=id_df)
+    wide_df = masked_array_to_wide_df(masked_array, 'test')
     
-    # Check that the values are JAX arrays, not lists
+    # Check that the values are JAX arrays, masks are numpy arrays
     val0 = wide_df['test$0$value']
     val1 = wide_df['test$1$value']
     mask0 = wide_df['test$0$mask']
@@ -587,20 +599,20 @@ def test_jax_arrays_remain_jax_arrays():
     
     assert isinstance(val0, jnp.ndarray), f"Expected JAX array, got {type(val0)}"
     assert isinstance(val1, jnp.ndarray), f"Expected JAX array, got {type(val1)}"
-    assert isinstance(mask0, jnp.ndarray), f"Expected JAX array, got {type(mask0)}"
-    assert isinstance(mask1, jnp.ndarray), f"Expected JAX array, got {type(mask1)}"
+    assert isinstance(mask0, np.ndarray), f"Expected numpy array, got {type(mask0)}"
+    assert isinstance(mask1, np.ndarray), f"Expected numpy array, got {type(mask1)}"
     
-    # Check that DataFrame recognizes them as JAX arrays
+    # Check that DataFrame recognizes them correctly
     assert wide_df.column_types['test$0$value'] == 'jax_array'
     assert wide_df.column_types['test$1$value'] == 'jax_array'
-    assert wide_df.column_types['test$0$mask'] == 'jax_array'
-    assert wide_df.column_types['test$1$mask'] == 'jax_array'
+    assert wide_df.column_types['test$0$mask'] == 'array'
+    assert wide_df.column_types['test$1$mask'] == 'array'
     
     # Test that we can do JAX operations on them
     sum_val0 = jnp.sum(val0)
     assert abs(sum_val0 - 4.0) < 1e-6
     
-    print("✓ JAX arrays preserved as JAX arrays in DataFrame!")
+    print("✓ JAX values and numpy masks preserved correctly in DataFrame!")
 
 
 @pytest.mark.skipif(not jax_available, reason="JAX not available")

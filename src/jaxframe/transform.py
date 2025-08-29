@@ -9,6 +9,7 @@ from typing import List, Tuple, Any, Union, Optional
 import re
 import numpy as np
 from .dataframe import DataFrame
+from .masked_array import MaskedArray
 
 
 def wide_to_long_masked(
@@ -244,14 +245,14 @@ def long_to_wide_masked(
     return DataFrame(wide_data)
 
 
-def wide_df_to_jax_arrays(
+def wide_df_to_masked_array(
     df: DataFrame,
     id_columns: Union[str, List[str]],
     var_pattern: str = r'([^$]+)\$(\d+)\$value',
     sort_by_var_index: bool = True
-) -> Tuple[Any, Any, DataFrame]:
+) -> MaskedArray:
     """
-    Convert a wide format DataFrame to JAX arrays for values and masks.
+    Convert a wide format DataFrame to a MaskedArray.
     
     Args:
         df: Wide format DataFrame with columns like 'var$0$value', 'var$1$value', etc.
@@ -260,10 +261,10 @@ def wide_df_to_jax_arrays(
         sort_by_var_index: Whether to sort columns by variable index (default: True)
     
     Returns:
-        Tuple of (values_array, mask_array, id_dataframe) where:
-        - values_array: JAX array of shape (n_rows, n_variables) 
-        - mask_array: JAX array of shape (n_rows, n_variables) with boolean masks
-        - id_dataframe: DataFrame containing only the ID columns
+        MaskedArray containing:
+        - data: JAX array of shape (n_rows, n_variables) 
+        - mask: NumPy array of shape (n_rows, n_variables) with boolean masks
+        - index_df: DataFrame containing only the ID columns
     """
     try:
         import jax.numpy as jnp
@@ -334,22 +335,18 @@ def wide_df_to_jax_arrays(
     id_data = {col: df[col] for col in id_columns}
     id_df = DataFrame(id_data)
     
-    return values, masks, id_df
+    return MaskedArray(data=values, mask=masks, index_df=id_df)
 
 
-def jax_arrays_to_wide_df(
-    values_array: Any,
-    mask_array: Any,
-    id_dataframe: DataFrame,
+def masked_array_to_wide_df(
+    masked_array: MaskedArray,
     var_prefix: str = 'var'
 ) -> DataFrame:
     """
-    Convert JAX arrays back to wide format DataFrame.
+    Convert a MaskedArray back to wide format DataFrame.
     
     Args:
-        values_array: JAX array of shape (n_rows, n_variables) with values
-        mask_array: JAX array of shape (n_rows, n_variables) with boolean masks
-        id_dataframe: DataFrame containing ID columns
+        masked_array: MaskedArray containing data, mask, and index_df
         var_prefix: Prefix for variable column names (default: 'var')
     
     Returns:
@@ -359,6 +356,10 @@ def jax_arrays_to_wide_df(
         import jax.numpy as jnp
     except ImportError:
         raise ImportError("JAX is required for this function. Install with: pip install jax")
+    
+    values_array = masked_array.data
+    mask_array = masked_array.mask
+    id_dataframe = masked_array.index_df
     
     if values_array.shape != mask_array.shape:
         raise ValueError(f"Values and mask arrays must have same shape. "
@@ -382,7 +383,8 @@ def jax_arrays_to_wide_df(
         values_col = values_array[:, var_idx]
         masks_col = mask_array[:, var_idx]
         
-        # Keep as JAX arrays to preserve computational graph
+        # Keep values as JAX arrays to preserve computational graph
+        # Keep masks as numpy arrays to avoid JAX compilation issues
         wide_data[value_col_name] = values_col
         wide_data[mask_col_name] = masks_col
     
@@ -396,7 +398,7 @@ def roundtrip_wide_jax_conversion(
     var_prefix: str = 'var'
 ) -> DataFrame:
     """
-    Test roundtrip conversion: wide DataFrame -> JAX arrays -> wide DataFrame.
+    Test roundtrip conversion: wide DataFrame -> MaskedArray -> wide DataFrame.
     
     This is a utility function for testing that the conversion process preserves data.
     
@@ -409,10 +411,10 @@ def roundtrip_wide_jax_conversion(
     Returns:
         Reconstructed wide format DataFrame
     """
-    # Convert to JAX arrays
-    values, masks, id_df = wide_df_to_jax_arrays(df, id_columns, var_pattern)
+    # Convert to MaskedArray
+    masked_array = wide_df_to_masked_array(df, id_columns, var_pattern)
     
     # Convert back to DataFrame
-    reconstructed = jax_arrays_to_wide_df(values, masks, id_df, var_prefix)
+    reconstructed = masked_array_to_wide_df(masked_array, var_prefix)
     
     return reconstructed
