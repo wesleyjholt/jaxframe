@@ -13,6 +13,98 @@ from .masked_array import MaskedArray
 
 
 def wide_to_long_masked(
+    df: Union[DataFrame, List[DataFrame]], 
+    id_columns: Union[str, List[str]], 
+    var_pattern: str = r'([^$]+)\$(\d+)\$(value|mask)',
+    var_name: Union[str, List[str]] = 'variable',
+    value_name: Union[str, List[str]] = 'value'
+) -> DataFrame:
+    """
+    Convert wide format DataFrame(s) to long format, applying masks to filter out invalid values.
+    
+    This function can handle either:
+    1. Single DataFrame conversion (original behavior)
+    2. Multiple DataFrame conversion where each DataFrame represents different variables
+    
+    Args:
+        df: Input DataFrame(s) in wide format. Can be:
+            - Single DataFrame for original behavior
+            - List of DataFrames for multi-variable conversion
+        id_columns: Column name(s) that identify each row (will be preserved in long format)
+        var_pattern: Regex pattern to parse column names. Should have 3 groups:
+                    (variable_name, time_index, column_type)
+                    Default matches patterns like 'time$0$value', 'time$1$mask', etc.
+        var_name: Name(s) for the variable column(s) in long format. Can be:
+                 - Single string for single DataFrame input
+                 - List of strings for multiple DataFrame input (must match df list length)
+        value_name: Name(s) for the value column(s) in long format. Can be:
+                   - Single string for single DataFrame input  
+                   - List of strings for multiple DataFrame input (must match df list length)
+    
+    Returns:
+        DataFrame in long format with id_columns and the specified variable/value columns
+        
+    Example:
+        Single DataFrame (original behavior):
+        >>> wide_df = DataFrame({
+        ...     'sample_id': ['001', '002', '003'],
+        ...     'time$0$value': [0.0, 0.1, 0.2],
+        ...     'time$1$value': [0.0, 0.2, 0.4], 
+        ...     'time$0$mask': [True, True, True],
+        ...     'time$1$mask': [True, True, False]
+        ... })
+        >>> long_df = wide_to_long_masked(wide_df, 'sample_id')
+        
+        Multiple DataFrames:
+        >>> time_df = DataFrame({'sample_id': [...], 'time$0$value': [...], ...})
+        >>> group_df = DataFrame({'sample_id': [...], 'group$0$value': [...], ...})
+        >>> long_df = wide_to_long_masked([time_df, group_df], 'sample_id', 
+        ...                              var_name=['variable', 'variable'], 
+        ...                              value_name=['time_value', 'group_value'])
+    """
+    # Handle single DataFrame case (backward compatibility)
+    if not isinstance(df, list):
+        return _single_wide_to_long_masked(df, id_columns, var_pattern, var_name, value_name)
+    
+    # Handle multiple DataFrames case
+    df_list = df
+    
+    # Validate inputs
+    if isinstance(var_name, str):
+        var_name = [var_name] * len(df_list)
+    if isinstance(value_name, str):
+        value_name = [value_name] * len(df_list)
+        
+    if len(var_name) != len(df_list):
+        raise ValueError(f"var_name list length ({len(var_name)}) must match df list length ({len(df_list)})")
+    if len(value_name) != len(df_list):
+        raise ValueError(f"value_name list length ({len(value_name)}) must match df list length ({len(df_list)})")
+    
+    # Convert each DataFrame to long format separately
+    long_dfs = []
+    for i, (df_single, var_n, val_n) in enumerate(zip(df_list, var_name, value_name)):
+        long_df = _single_wide_to_long_masked(df_single, id_columns, var_pattern, var_n, val_n)
+        long_dfs.append(long_df)
+    
+    # Merge all long DataFrames on id_columns
+    if len(long_dfs) == 1:
+        return long_dfs[0]
+    
+    # Start with the first DataFrame and join the rest
+    result = long_dfs[0]
+    for i in range(1, len(long_dfs)):
+        # Join on id_columns and var_name columns
+        join_columns = id_columns if isinstance(id_columns, list) else [id_columns]
+        join_columns = join_columns + [var_name[0]]  # Use first var_name as variable column
+        
+        # Get the value column from the next DataFrame
+        value_col = value_name[i]
+        result = result.join(long_dfs[i], on=join_columns, source=value_col)
+    
+    return result
+
+
+def _single_wide_to_long_masked(
     df: DataFrame, 
     id_columns: Union[str, List[str]], 
     var_pattern: str = r'([^$]+)\$(\d+)\$(value|mask)',
@@ -20,35 +112,9 @@ def wide_to_long_masked(
     value_name: str = 'value'
 ) -> DataFrame:
     """
-    Convert a wide format DataFrame to long format, applying masks to filter out invalid values.
+    Convert a single wide format DataFrame to long format (internal helper function).
     
-    This function takes a DataFrame in wide format where columns follow the pattern
-    'var$N$value' and 'var$N$mask', and converts it to long format. Only values
-    where the corresponding mask is True are included in the output.
-    
-    Args:
-        df: Input DataFrame in wide format
-        id_columns: Column name(s) that identify each row (will be preserved in long format)
-        var_pattern: Regex pattern to parse column names. Should have 3 groups:
-                    (variable_name, time_index, column_type)
-                    Default matches patterns like 'time$0$value', 'time$1$mask', etc.
-        var_name: Name for the variable column in long format (default: 'variable')
-        value_name: Name for the value column in long format (default: 'value')
-    
-    Returns:
-        DataFrame in long format with id_columns, var_name, and value_name columns
-        
-    Example:
-        >>> # Wide format with masked time series data
-        >>> wide_df = DataFrame({
-        ...     'sample_id': ['001', '002', '003'],
-        ...     'time$0$value': [0.0, 0.1, 0.2],
-        ...     'time$1$value': [0.0, 0.2, 0.4], 
-        ...     'time$0$mask': [True, True, True],
-        ...     'time$1$mask': [True, True, False]  # Last sample masked for time 1
-        ... })
-        >>> long_df = wide_to_long_masked(wide_df, 'sample_id')
-        >>> # Result will have 5 rows (3 for time 0, 2 for time 1)
+    This is the original implementation for single DataFrame conversion.
     """
     # Ensure id_columns is a list
     if isinstance(id_columns, str):
@@ -109,6 +175,115 @@ def wide_to_long_masked(
 def long_to_wide_masked(
     df: DataFrame,
     id_columns: Union[str, List[str]],
+    value_column: Union[str, List[str]],
+    var_column: Optional[Union[str, List[str]]] = None,
+    var_prefix: Union[str, List[str]] = 'var',
+    fill_type: Union[Any, str, List[Union[Any, str]]] = 0.0,
+    mask_value: bool = False
+) -> Union[DataFrame, List[DataFrame]]:
+    """
+    Convert a long format DataFrame to wide format with mask columns.
+    
+    This function can handle either:
+    1. Single column conversion (original behavior) 
+    2. Multiple column conversion where multiple variables are processed simultaneously
+    
+    Args:
+        df: Input DataFrame in long format
+        id_columns: Column name(s) that identify each entity
+        value_column: Column name(s) containing the values. Can be:
+                     - Single string for original behavior
+                     - List of strings for multi-variable conversion
+        var_column: Column name(s) containing the variable indices/names. Can be:
+                   - Single string or None for original behavior
+                   - List of strings/None for multi-variable conversion
+                   If not provided, will assign indices based on order within each ID group.
+        var_prefix: Prefix(es) for variable names in wide format. Can be:
+                   - Single string for original behavior
+                   - List of strings for multi-variable conversion
+        fill_type: Fill strategy for missing observations. Can be:
+                  - Single value/strategy for original behavior
+                  - List of values/strategies for multi-variable conversion
+                  Strategies: specific value, 'local_max', 'global_max'
+        mask_value: Mask value for missing observations (default: False)
+    
+    Returns:
+        DataFrame(s) in wide format:
+        - Single DataFrame if single column input
+        - List of DataFrames if multiple column input
+    
+    Notes:
+        - For string dtypes, 'local_max' and 'global_max' fill_types will raise ValueError
+        - All output DataFrames maintain consistent row ordering based on first value_column
+    """
+    # Handle single column case (backward compatibility)
+    if isinstance(value_column, str):
+        return _single_long_to_wide_masked(df, id_columns, value_column, var_column, 
+                                         var_prefix, fill_type, mask_value)
+    
+    # Handle multiple columns case
+    value_columns = value_column
+    
+    # Normalize inputs to lists
+    if isinstance(var_column, str) or var_column is None:
+        var_columns = [var_column] * len(value_columns)
+    else:
+        var_columns = var_column
+        
+    if isinstance(var_prefix, str):
+        var_prefixes = [var_prefix] * len(value_columns)
+    else:
+        var_prefixes = var_prefix
+        
+    if not isinstance(fill_type, list):
+        fill_types = [fill_type] * len(value_columns)
+    else:
+        fill_types = fill_type
+    
+    # Validate input lengths
+    if len(var_columns) != len(value_columns):
+        raise ValueError(f"var_column list length ({len(var_columns)}) must match value_column length ({len(value_columns)})")
+    if len(var_prefixes) != len(value_columns):
+        raise ValueError(f"var_prefix list length ({len(var_prefixes)}) must match value_column length ({len(value_columns)})")
+    if len(fill_types) != len(value_columns):
+        raise ValueError(f"fill_type list length ({len(fill_types)}) must match value_column length ({len(value_columns)})")
+    
+    # Check for invalid fill_types with string data
+    for i, (val_col, fill_t) in enumerate(zip(value_columns, fill_types)):
+        if fill_t in ['local_max', 'global_max']:
+            # Check if this column contains string data
+            sample_values = [df[val_col][j] for j in range(min(10, len(df)))]
+            if any(isinstance(v, str) for v in sample_values):
+                raise ValueError(f"fill_type '{fill_t}' not supported for string data in column '{val_col}'. "
+                               f"Use a specific string value instead.")
+    
+    # Process each column and ensure consistent ordering
+    # The ordering is determined by the first value column
+    wide_dfs = []
+    reference_ordering = None
+    
+    for i, (val_col, var_col, var_pref, fill_t) in enumerate(zip(value_columns, var_columns, var_prefixes, fill_types)):
+        wide_df = _single_long_to_wide_masked(df, id_columns, val_col, var_col, 
+                                            var_pref, fill_t, mask_value)
+        
+        if i == 0:
+            # First DataFrame establishes the reference ordering
+            if isinstance(id_columns, str):
+                reference_ordering = [wide_df.get_row(j)[id_columns] for j in range(len(wide_df))]
+            else:
+                reference_ordering = [tuple(wide_df.get_row(j)[col] for col in id_columns) for j in range(len(wide_df))]
+            wide_dfs.append(wide_df)
+        else:
+            # Reorder subsequent DataFrames to match the reference ordering
+            reordered_df = _reorder_dataframe_by_ids(wide_df, id_columns, reference_ordering)
+            wide_dfs.append(reordered_df)
+    
+    return wide_dfs
+
+
+def _single_long_to_wide_masked(
+    df: DataFrame,
+    id_columns: Union[str, List[str]],
     value_column: str,
     var_column: Optional[str] = None,
     var_prefix: str = 'var',
@@ -116,28 +291,18 @@ def long_to_wide_masked(
     mask_value: bool = False
 ) -> DataFrame:
     """
-    Convert a long format DataFrame to wide format with mask columns.
+    Convert a single column from long format to wide format (internal helper function).
     
-    This is the inverse operation of wide_to_long_masked. It takes a DataFrame
-    in long format and creates a wide format with both value and mask columns.
-    
-    Args:
-        df: Input DataFrame in long format
-        id_columns: Column name(s) that identify each entity
-        value_column: Column containing the values
-        var_column: Column containing the variable indices/names (optional).
-                   If not provided, will assign indices 0, 1, 2, ... based on
-                   the order of values within each ID group.
-        var_prefix: Prefix for variable names in wide format (default: 'var')
-        fill_type: Fill strategy for missing observations. Can be:
-                  - A specific value (e.g., 0.0, -999)
-                  - 'local_max': Use the maximum value for each ID
-                  - 'global_max': Use the global maximum value across all data
-        mask_value: Mask value for missing observations (default: False)
-    
-    Returns:
-        DataFrame in wide format with var_prefix$N$value and var_prefix$N$mask columns
+    This is the original implementation for single column conversion.
     """
+    # Check for invalid fill_types with string data
+    if fill_type in ['local_max', 'global_max']:
+        # Check if this column contains string data
+        sample_values = [df[value_column][j] for j in range(min(10, len(df)))]
+        if any(isinstance(v, str) for v in sample_values):
+            raise ValueError(f"fill_type '{fill_type}' not supported for string data in column '{value_column}'. "
+                           f"Use a specific string value instead.")
+    
     # Ensure id_columns is a list
     if isinstance(id_columns, str):
         id_columns = [id_columns]
@@ -243,6 +408,45 @@ def long_to_wide_masked(
                 wide_data[mask_col_name].append(mask_value)
     
     return DataFrame(wide_data)
+
+
+def _reorder_dataframe_by_ids(df: DataFrame, id_columns: Union[str, List[str]], reference_ordering: List) -> DataFrame:
+    """
+    Reorder a DataFrame to match a reference ordering of ID values.
+    
+    Args:
+        df: DataFrame to reorder
+        id_columns: Column name(s) that identify each row
+        reference_ordering: List of ID tuples in the desired order
+        
+    Returns:
+        Reordered DataFrame
+    """
+    if isinstance(id_columns, str):
+        id_columns = [id_columns]
+    
+    # Create a mapping from ID tuple to row index in the original DataFrame
+    id_to_row = {}
+    for row_idx in range(len(df)):
+        if len(id_columns) == 1:
+            id_key = df[id_columns[0]][row_idx]
+        else:
+            id_key = tuple(df[id_col][row_idx] for id_col in id_columns)
+        id_to_row[id_key] = row_idx
+    
+    # Build reordered data
+    reordered_data = {col: [] for col in df.columns}
+    
+    for id_key in reference_ordering:
+        if id_key in id_to_row:
+            row_idx = id_to_row[id_key]
+            for col in df.columns:
+                reordered_data[col].append(df[col][row_idx])
+        else:
+            # This shouldn't happen if the DataFrames are consistent
+            raise ValueError(f"ID {id_key} not found in DataFrame being reordered")
+    
+    return DataFrame(reordered_data)
 
 
 def wide_df_to_masked_array(
