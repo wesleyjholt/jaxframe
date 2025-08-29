@@ -266,6 +266,47 @@ class DataFrame:
         
         return True
     
+    def __hash__(self) -> int:
+        """
+        Compute hash for the DataFrame to enable use as static argument in JAX JIT.
+        
+        Returns:
+            Hash value based on columns, shape, and a sample of the data
+        """
+        # Create a hash based on structure and a sample of data
+        # Use tuple of columns for basic structure
+        structure_hash = hash(tuple(self._columns))
+        
+        # Include shape information
+        shape_hash = hash((self._length, len(self._columns)))
+        
+        # Include name if present
+        name_hash = hash(self._name) if self._name else 0
+        
+        # Sample a few values from the data for content-based hashing
+        # This is a compromise between performance and uniqueness
+        data_sample = []
+        max_sample_rows = min(3, self._length)
+        max_sample_cols = min(3, len(self._columns))
+        
+        for i in range(max_sample_rows):
+            for j, col in enumerate(self._columns[:max_sample_cols]):
+                try:
+                    value = self._data[col][i]
+                    # Convert to a hashable type
+                    if hasattr(value, 'item'):  # numpy scalar or JAX scalar
+                        data_sample.append(float(value.item()))
+                    else:
+                        data_sample.append(hash(str(value)))
+                except (TypeError, ValueError):
+                    # If value is not hashable, use its string representation
+                    data_sample.append(hash(str(value)))
+        
+        data_hash = hash(tuple(data_sample))
+        
+        # Combine all hashes
+        return hash((structure_hash, shape_hash, name_hash, data_hash))
+    
     def to_dict(self) -> Dict[str, Union[List[Any], np.ndarray, Any]]:
         """
         Convert DataFrame to dictionary of arrays and lists.

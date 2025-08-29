@@ -117,6 +117,38 @@ class MaskedArray:
             # Fallback comparison without JAX
             return False
     
+    def __hash__(self) -> int:
+        """
+        Compute hash for the MaskedArray to enable use as static argument in JAX JIT.
+        
+        Returns:
+            Hash value based on shape, mask pattern, and a sample of the data
+        """
+        # Hash based on shape
+        shape_hash = hash(self.shape)
+        
+        # Hash based on mask pattern (sample for performance)
+        mask_sample = self._mask.flatten()[:min(20, self._mask.size)]
+        mask_hash = hash(tuple(mask_sample))
+        
+        # Hash based on data sample
+        try:
+            import jax.numpy as jnp
+            data_flat = self._data.flatten()
+            data_sample = data_flat[:min(10, data_flat.size)]
+            # Convert JAX array to regular values for hashing
+            data_values = [float(x) for x in data_sample]
+            data_hash = hash(tuple(data_values))
+        except (ImportError, TypeError):
+            # Fallback if JAX not available or conversion fails
+            data_hash = hash(str(self._data.shape))
+        
+        # Hash based on index DataFrame
+        index_hash = hash(self._index_df)
+        
+        # Combine all hashes
+        return hash((shape_hash, mask_hash, data_hash, index_hash))
+    
     def copy(self) -> 'MaskedArray':
         """Create a copy of the MaskedArray."""
         try:
