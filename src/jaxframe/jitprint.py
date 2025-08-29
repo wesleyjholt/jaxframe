@@ -11,6 +11,49 @@ import numpy as np
 from typing import Any, Dict, List, Union
 
 
+def _format_value_for_jit_print(value: Any) -> str:
+    """
+    Format a value for JIT-compatible printing, handling JAX tracers elegantly.
+    
+    Args:
+        value: The value to format
+        
+    Returns:
+        A string representation suitable for JIT printing
+    """
+    # Check if it's a JAX tracer by looking for common tracer attributes
+    if hasattr(value, 'aval') and hasattr(value, 'shape') and hasattr(value, 'dtype'):
+        # It's likely a JAX tracer - format it like equinox does
+        dtype_str = str(value.dtype)
+        # Convert numpy.float32 -> f32, numpy.int32 -> i32, etc.
+        if dtype_str.startswith('float'):
+            dtype_str = 'f' + dtype_str[5:]  # float32 -> f32
+        elif dtype_str.startswith('int'):
+            dtype_str = 'i' + dtype_str[3:]   # int32 -> i32
+        elif dtype_str.startswith('bool'):
+            dtype_str = 'bool'
+        elif dtype_str.startswith('complex'):
+            dtype_str = 'c' + dtype_str[7:]   # complex64 -> c64
+        
+        # Format shape
+        if value.shape == ():
+            return dtype_str  # scalar
+        else:
+            shape_str = 'x'.join(map(str, value.shape))
+            return f"{dtype_str}[{shape_str}]"
+    
+    # For regular values, use the existing formatting logic
+    if isinstance(value, float):
+        return f"{value:.3f}"
+    elif hasattr(value, 'item'):  # numpy scalar or JAX scalar (when not traced)
+        try:
+            return f"{value.item():.3f}" if isinstance(value.item(), float) else str(value.item())
+        except (TypeError, ValueError):
+            return str(value)
+    else:
+        return str(value)
+
+
 def jit_print_dataframe(df: Any) -> None:
     """
     Print a DataFrame representation that works within jax.jit.
@@ -56,11 +99,9 @@ def jit_print_dataframe(df: Any) -> None:
         row_data = []
         for col in df._columns:
             value = df._data[col][i]
-            # Format the value nicely (same as regular __repr__)
-            if isinstance(value, float):
-                row_data.append(f"{value:.3f}")
-            else:
-                row_data.append(str(value))
+            # Format the value nicely, handling JAX tracers
+            formatted_value = _format_value_for_jit_print(value)
+            row_data.append(formatted_value)
         
         # Create the row representation
         row_dict_str = ", ".join([f"'{col}': '{val}'" for col, val in zip(df._columns, row_data)])
@@ -147,9 +188,9 @@ def jit_print_dataframe_data(data: Dict[str, Any], columns: List[str], length: i
         row_values = []
         for col in columns:
             value = data[col][i]
-            # Format values - note: this is simplified since we can't easily
-            # check types in JIT context
-            row_values.append(str(value))
+            # Format values using our helper function
+            formatted_value = _format_value_for_jit_print(value)
+            row_values.append(formatted_value)
         
         row_dict_str = ", ".join([f"'{col}': '{val}'" for col, val in zip(columns, row_values)])
         jax.debug.print("  [{}]: {{{}}}", i, row_dict_str)
