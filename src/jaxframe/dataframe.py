@@ -146,6 +146,23 @@ class DataFrame:
         """Get the data types of columns ('list' or 'array')."""
         return self._column_types.copy()
     
+    def dtypes(self) -> Dict[str, str]:
+        """Get detailed data types for each column."""
+        dtypes = {}
+        for col_name, col_data in self._data.items():
+            if hasattr(col_data, 'dtype'):
+                # For numpy arrays or JAX arrays
+                dtypes[col_name] = str(col_data.dtype)
+            elif isinstance(col_data, list) and len(col_data) > 0:
+                # For lists, get the type of the first element
+                first_element = col_data[0]
+                element_type = type(first_element).__name__
+                dtypes[col_name] = f"list[{element_type}]"
+            else:
+                # Fallback
+                dtypes[col_name] = type(col_data).__name__
+        return dtypes
+    
     def __len__(self) -> int:
         """Get the number of rows in the DataFrame."""
         return self._length
@@ -203,18 +220,75 @@ class DataFrame:
         lines = [f"DataFrame{name_part}({self.shape[0]} rows, {self.shape[1]} columns)"]
         lines.append("Columns: " + ", ".join(self._columns))
         
+        # Add dtypes information
+        dtypes = self.dtypes()
+        dtype_strs = [f"{col}: {dtypes[col]}" for col in self._columns]
+        lines.append("Dtypes: " + ", ".join(dtype_strs))
+        
         # Show first few rows
         max_display_rows = 5
         for i in range(min(self._length, max_display_rows)):
-            row_data = []
+            row_dict = {}
             for col in self._columns:
                 value = self._data[col][i]
-                # Format the value nicely
-                if isinstance(value, float):
-                    row_data.append(f"{value:.3f}")
+                # Format the value without quotes for numeric types
+                if isinstance(value, (int, float)):
+                    if isinstance(value, float):
+                        row_dict[col] = f"{value:.3f}"
+                    else:
+                        row_dict[col] = str(value)
                 else:
-                    row_data.append(str(value))
-            lines.append(f"  [{i}]: {dict(zip(self._columns, row_data))}")
+                    # Check if it's a numpy scalar
+                    try:
+                        import numpy as np
+                        if isinstance(value, np.integer):
+                            row_dict[col] = str(int(value))
+                        elif isinstance(value, np.floating):
+                            row_dict[col] = f"{float(value):.3f}"
+                        else:
+                            # Check if it's a JAX array/scalar
+                            try:
+                                import jax
+                                if hasattr(value, 'dtype') and (
+                                    str(type(value)).startswith('<class \'jaxlib.') or
+                                    str(type(value).__module__).startswith('jax')):
+                                    # Extract the underlying value from JAX array/scalar
+                                    scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
+                                    if isinstance(scalar_value, float):
+                                        row_dict[col] = f"{scalar_value:.3f}"
+                                    else:
+                                        row_dict[col] = str(scalar_value)
+                                else:
+                                    # For strings and other non-JAX types, keep quotes
+                                    row_dict[col] = repr(value)
+                            except ImportError:
+                                # JAX not available, treat as regular value
+                                row_dict[col] = repr(value)
+                    except ImportError:
+                        # Numpy not available, check JAX only
+                        try:
+                            import jax
+                            if hasattr(value, 'dtype') and (
+                                str(type(value)).startswith('<class \'jaxlib.') or
+                                str(type(value).__module__).startswith('jax')):
+                                # Extract the underlying value from JAX array/scalar
+                                scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
+                                if isinstance(scalar_value, float):
+                                    row_dict[col] = f"{scalar_value:.3f}"
+                                else:
+                                    row_dict[col] = str(scalar_value)
+                            else:
+                                # For strings and other types, keep quotes
+                                row_dict[col] = repr(value)
+                        except ImportError:
+                            # Neither numpy nor JAX available
+                            row_dict[col] = repr(value)
+            
+            # Manually format the dictionary to control quote display
+            items = []
+            for col in self._columns:
+                items.append(f"'{col}': {row_dict[col]}")
+            lines.append(f"  [{i}]: {{{', '.join(items)}}}")
         
         if self._length > max_display_rows:
             lines.append(f"  ... ({self._length - max_display_rows} more rows)")
