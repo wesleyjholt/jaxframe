@@ -293,3 +293,39 @@ class TestTracerFormatting:
         
         result = test_nested()
         assert result.shape == (2,)
+    
+    def test_emergency_catch_all_for_complex_tracers(self):
+        """Test the emergency catch-all detection for very complex tracers."""
+        
+        # Create a mock tracer that simulates the problematic case
+        class MockProblematicTracer:
+            def __init__(self, has_aval=True):
+                if has_aval:
+                    class MockAval:
+                        def __init__(self):
+                            self.dtype = 'float32'
+                            self.shape = (3,)
+                    self.aval = MockAval()
+            
+            def __str__(self):
+                # Very long string that should trigger emergency catch-all
+                return ("Traced<ShapedArray(float32[])>with<JVPTrace> with\n  primal = Array(0.11994141, dtype=float32)\n  "
+                        "tangent = Traced<ShapedArray(float32[])>with<JaxprTrace> with\n    pval = (ShapedArray(float32[]), None)\n    "
+                        "recipe = JaxprEqnRecipe(eqn_id=<object object at 0x1681ea540>, in_tracers=(Traced<ShapedArray(float32[1]):JaxprTrace>,), "
+                        "out_tracer_refs=[<weakref at 0x1681f4f40; to 'JaxprTracer' at 0x1681f4550>], out_avals=[ShapedArray(float32[])], "
+                        "primitive=squeeze, params={'dimensions': (0,)}, effects=frozenset())")
+        
+        # Test with aval
+        tracer_with_aval = MockProblematicTracer(has_aval=True)
+        formatted_with_aval = _format_value_for_jit_print(tracer_with_aval)
+        assert formatted_with_aval == "f32[3]", f"Expected 'f32[3]', got '{formatted_with_aval}'"
+        
+        # Test without aval (should fall back to <tracer>)
+        tracer_no_aval = MockProblematicTracer(has_aval=False)
+        formatted_no_aval = _format_value_for_jit_print(tracer_no_aval)
+        assert formatted_no_aval == "<tracer>", f"Expected '<tracer>', got '{formatted_no_aval}'"
+        
+        # Test that normal values are not affected
+        normal_value = 3.14159
+        formatted_normal = _format_value_for_jit_print(normal_value)
+        assert formatted_normal == "3.142", f"Expected '3.142', got '{formatted_normal}'"

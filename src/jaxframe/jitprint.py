@@ -24,21 +24,77 @@ def _format_value_for_jit_print(value: Any) -> str:
     Returns:
         A clean string representation of the value
     """
-    # Handle complex JAX tracers (JVP, Batched, etc.) - look for nested structure
-    if hasattr(value, '__class__') and 'Traced' in str(type(value)):
-        # Try to extract aval from complex tracers
-        aval = None
-        if hasattr(value, 'aval'):
-            aval = value.aval
-        elif hasattr(value, 'primal') and hasattr(value.primal, 'aval'):
-            aval = value.primal.aval
-        elif hasattr(value, 'primal') and hasattr(value.primal, 'shape') and hasattr(value.primal, 'dtype'):
-            # Create a mock aval-like object
+    
+    def extract_aval_info(obj):
+        """Try multiple strategies to extract aval information from a JAX object."""
+        # Strategy 1: Direct aval access
+        if hasattr(obj, 'aval'):
+            return obj.aval
+        
+        # Strategy 2: Through primal
+        if hasattr(obj, 'primal'):
+            if hasattr(obj.primal, 'aval'):
+                return obj.primal.aval
+            # Recursive check for nested primals
+            return extract_aval_info(obj.primal)
+        
+        # Strategy 3: Direct shape/dtype access
+        if hasattr(obj, 'shape') and hasattr(obj, 'dtype'):
             class MockAval:
                 def __init__(self, shape, dtype):
                     self.shape = shape
                     self.dtype = dtype
-            aval = MockAval(value.primal.shape, value.primal.dtype)
+            return MockAval(obj.shape, obj.dtype)
+        
+        # Strategy 4: Look for _aval attribute (some tracers use this)
+        if hasattr(obj, '_aval'):
+            return obj._aval
+            
+        # Strategy 5: Check for tangent (in JVP tracers)
+        if hasattr(obj, 'tangent'):
+            return extract_aval_info(obj.tangent)
+        
+        return None
+    
+    # First, check if the string representation looks like a complex tracer
+    # This is our "emergency catch-all" for tracers we might miss
+    str_repr = str(value)
+    if len(str_repr) > 100 and ('Traced<' in str_repr or 'JVPTrace' in str_repr or 'JaxprTrace' in str_repr):
+        # This looks like a complex tracer that we need to handle
+        aval = extract_aval_info(value)
+        if aval is not None:
+            dtype_str = str(aval.dtype)
+            dtype_map = {
+                'float32': 'f32', 'float64': 'f64',
+                'int32': 'i32', 'int64': 'i64', 
+                'bool': 'bool', 'complex64': 'c64', 'complex128': 'c128'
+            }
+            dtype_str = dtype_map.get(dtype_str, dtype_str)
+            
+            if aval.shape == ():
+                return dtype_str  # scalar
+            else:
+                shape_str = 'x'.join(map(str, aval.shape))
+                return f"{dtype_str}[{shape_str}]"
+        else:
+            # Absolute fallback - return generic tracer indicator
+            return "<tracer>"
+    
+    # Check if this looks like any kind of JAX tracer
+    is_likely_tracer = (
+        # Check for 'Traced' in type name
+        ('Traced' in str(type(value))) or
+        # Check for common tracer attributes
+        (hasattr(value, 'aval')) or
+        (hasattr(value, 'primal')) or
+        # Check for tracer-like class names
+        ('Tracer' in str(type(value))) or
+        ('JVP' in str(type(value))) or
+        ('Jaxpr' in str(type(value)))
+    )
+    
+    if is_likely_tracer:
+        aval = extract_aval_info(value)
         
         if aval is not None:
             # Extract clean dtype and shape info from aval
@@ -57,25 +113,10 @@ def _format_value_for_jit_print(value: Any) -> str:
             else:
                 shape_str = 'x'.join(map(str, aval.shape))
                 return f"{dtype_str}[{shape_str}]"
-    
-    # Check if this looks like a basic JAX tracer
-    if hasattr(value, 'aval') and hasattr(value, 'shape') and hasattr(value, 'dtype'):
-        # Extract clean dtype and shape info
-        dtype_str = str(value.dtype)
-        
-        # Clean up dtype strings (e.g., 'float32' -> 'f32')
-        dtype_map = {
-            'float32': 'f32', 'float64': 'f64',
-            'int32': 'i32', 'int64': 'i64',
-            'bool': 'bool', 'complex64': 'c64', 'complex128': 'c128'
-        }
-        dtype_str = dtype_map.get(dtype_str, dtype_str)
-        
-        if value.shape == ():
-            return dtype_str  # scalar
         else:
-            shape_str = 'x'.join(map(str, value.shape))
-            return f"{dtype_str}[{shape_str}]"
+            # Fallback: if we can't extract aval info but it's clearly a tracer,
+            # return a generic tracer indicator rather than the ugly string
+            return "<tracer>"
     
     # For regular values, use the existing formatting logic
     if isinstance(value, float):
