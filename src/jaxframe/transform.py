@@ -17,7 +17,7 @@ def wide_to_long_masked(
     id_columns: Union[str, List[str]], 
     var_pattern: str = r'([^$]+)\$(\d+)\$(value|mask)',
     var_name: Union[str, List[str]] = 'variable',
-    value_name: Union[str, List[str]] = 'value'
+    value_name: Union[str, List[str], None] = None
 ) -> DataFrame:
     """
     Convert wide format DataFrame(s) to long format, applying masks to filter out invalid values.
@@ -40,6 +40,7 @@ def wide_to_long_masked(
         value_name: Name(s) for the value column(s) in long format. Can be:
                    - Single string for single DataFrame input  
                    - List of strings for multiple DataFrame input (must match df list length)
+                   - None (default) to automatically extract names from DataFrame variable patterns
     
     Returns:
         DataFrame in long format with id_columns and the specified variable/value columns
@@ -68,6 +69,27 @@ def wide_to_long_masked(
     
     # Handle multiple DataFrames case
     df_list = df
+    
+    # Validate parameter types for multi-DataFrame case
+    if isinstance(df, list) and value_name is not None and not isinstance(value_name, list):
+        raise ValueError(f"When df is a list of DataFrames, value_name must be a list or None, "
+                        f"got {type(value_name).__name__}")
+    
+    # Extract default value names from DataFrames if value_name is None
+    if value_name is None:
+        value_name = []
+        for i, df_single in enumerate(df_list):
+            # Extract variable name from the first value column found
+            pattern = re.compile(var_pattern)
+            for col in df_single.columns:
+                match = pattern.match(str(col))
+                if match and match.group(3) == 'value':
+                    var_base_name = match.group(1)
+                    value_name.append(f"{var_base_name}_value")
+                    break
+            else:
+                # If no matching pattern found, use generic name
+                value_name.append(f"value_{i}")
     
     # Validate inputs
     if isinstance(var_name, str):
@@ -109,13 +131,26 @@ def _single_wide_to_long_masked(
     id_columns: Union[str, List[str]], 
     var_pattern: str = r'([^$]+)\$(\d+)\$(value|mask)',
     var_name: str = 'variable',
-    value_name: str = 'value'
+    value_name: Union[str, None] = 'value'
 ) -> DataFrame:
     """
     Convert a single wide format DataFrame to long format (internal helper function).
     
     This is the original implementation for single DataFrame conversion.
     """
+    # Handle default value_name
+    if value_name is None:
+        pattern = re.compile(var_pattern)
+        for col in df.columns:
+            match = pattern.match(str(col))
+            if match and match.group(3) == 'value':
+                var_base_name = match.group(1)
+                value_name = f"{var_base_name}_value"
+                break
+        else:
+            # If no matching pattern found, use generic name
+            value_name = 'value'
+    
     # Ensure id_columns is a list
     if isinstance(id_columns, str):
         id_columns = [id_columns]
