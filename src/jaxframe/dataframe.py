@@ -224,6 +224,7 @@ class DataFrame:
         return {col: self._data[col] for col in columns 
                 if col in self._data and self._column_types[col] == ColumnType.JAX_ARRAY.value}
     
+    @property
     def dtypes(self) -> Dict[str, str]:
         """Get detailed data types for each column."""
         dtypes = {}
@@ -240,6 +241,14 @@ class DataFrame:
                 # Fallback
                 dtypes[col_name] = type(col_data).__name__
         return dtypes
+    
+    @property
+    def schema(self) -> Dict[str, str]:
+        """Get the schema of the DataFrame (column names to data types mapping).
+        
+        This is an alias for dtypes to match Polars API.
+        """
+        return self.dtypes
     
     def __len__(self) -> int:
         """Get the number of rows in the DataFrame."""
@@ -557,7 +566,10 @@ class DataFrame:
     
     def __str__(self) -> str:
         """String representation using Polars-like formatting."""
-        return self.to_string()
+        table_str = self.to_string()
+        if self.name is not None:
+            return f"{self.name}:\n{table_str}"
+        return table_str
     
     def __repr__(self) -> str:
         """String representation of the DataFrame."""
@@ -570,7 +582,7 @@ class DataFrame:
         lines.append("Columns: " + ", ".join(self._columns))
         
         # Add dtypes information
-        dtypes = self.dtypes()
+        dtypes = self.dtypes
         dtype_strs = [f"{col}: {dtypes[col]}" for col in self._columns]
         lines.append("Dtypes: " + ", ".join(dtype_strs))
         
@@ -1516,19 +1528,61 @@ class DataFrame:
     def update_lookup_table(self, other: 'DataFrame', id_columns: Union[str, List[str]], 
                            strict: bool = True) -> 'DataFrame':
         """
-        Update this lookup table with rows from another DataFrame.
+        Update this lookup table with rows from another DataFrame using UPSERT semantics.
+        
+        This method performs an "upsert" operation (UPDATE + INSERT) on the current DataFrame
+        using another DataFrame as the source of updates. It maintains referential integrity
+        by ensuring both DataFrames are valid lookup tables (no duplicate keys).
+        
+        For existing keys (UPDATE):
+        - In strict mode: Validates that all non-key column values match exactly, raising
+          an error if any conflicts are found
+        - In non-strict mode: Replaces existing values with new values from the update DataFrame
+        
+        For new keys (INSERT):
+        - Always adds new rows from the update DataFrame that don't exist in the current DataFrame
+        
+        This is conceptually similar to a database UPSERT operation or SQL's MERGE statement,
+        but with stronger validation guarantees to ensure data integrity.
         
         Args:
-            other: DataFrame containing rows to add/update
-            id_columns: Column name(s) that form the lookup key
-            strict: If True, raises error on value mismatches. If False, replaces with new values.
-            
+            other: DataFrame containing rows to add/update. Must have identical column structure
+                  to the current DataFrame and be a valid lookup table (no duplicate keys).
+            id_columns: Column name(s) that form the lookup key. Can be a single column name
+                       or a list of column names for composite keys. These columns uniquely
+                       identify each row and are used to match rows between DataFrames.
+            strict: If True (default), raises ValueError when existing key-value pairs have
+                   conflicting non-key values. If False, replaces conflicting values with
+                   new values from the update DataFrame.
+                   
         Returns:
-            New DataFrame with updated lookup table
+            New DataFrame with updated lookup table containing:
+            - All rows from current DataFrame with non-conflicting keys
+            - Updated values for existing keys (in non-strict mode) or validated matches (strict mode)
+            - All new rows from the update DataFrame
             
         Raises:
-            ValueError: If DataFrames have incompatible columns or if strict=True and values mismatch
-            KeyError: If id_columns don't exist in both DataFrames
+            ValueError: If DataFrames have different column structures, if either DataFrame
+                       contains duplicate keys, or if strict=True and value conflicts are detected.
+            KeyError: If id_columns don't exist in both DataFrames.
+            
+        Examples:
+            Basic single-column key update:
+            >>> df = DataFrame({'id': [1, 2, 3], 'value': [10, 20, 30]})
+            >>> updates = DataFrame({'id': [2, 4], 'value': [99, 40]})
+            >>> result = df.update_lookup_table(updates, 'id', strict=False)
+            # Result: id=[1,2,3,4], value=[10,99,30,40]
+            
+            Multi-column key with strict validation:
+            >>> df = DataFrame({'region': ['US', 'EU'], 'product': ['A', 'B'], 'price': [100, 200]})
+            >>> updates = DataFrame({'region': ['US', 'ASIA'], 'product': ['A', 'A'], 'price': [100, 150]})
+            >>> result = df.update_lookup_table(updates, ['region', 'product'], strict=True)
+            # Validates US-A price matches (100), adds ASIA-A as new row
+            
+        Note:
+            Both DataFrames must be valid lookup tables (no duplicate key combinations).
+            This method provides stronger guarantees than pandas merge or polars update
+            by validating data integrity and preventing accidental data corruption.
         """
         if isinstance(id_columns, str):
             id_columns = [id_columns]
@@ -1645,3 +1699,217 @@ class DataFrame:
             return abs(val1 - val2) < 1e-10
         
         return val1 == val2
+    
+    # Polars-compatible methods
+    def vstack(self, other: 'DataFrame', *, in_place: bool = False) -> 'DataFrame':
+        """
+        Grow this DataFrame vertically by stacking a DataFrame to it.
+        
+        This is a Polars-compatible method that performs vertical concatenation.
+        
+        Args:
+            other: DataFrame to stack
+            in_place: If True, modifies this DataFrame in place (not supported, raises error)
+            
+        Returns:
+            New DataFrame with other stacked vertically
+            
+        Raises:
+            TypeError: If other is not a DataFrame
+            ValueError: If DataFrames don't have the same columns
+            NotImplementedError: If in_place=True (JAXFrame is immutable)
+        """
+        if in_place:
+            raise NotImplementedError("JAXFrame DataFrames are immutable, in_place=True not supported")
+        
+        if not isinstance(other, DataFrame):
+            raise TypeError("Can only vstack with another DataFrame")
+        
+        # Check that both DataFrames have the same columns
+        if set(self._columns) != set(other._columns):
+            raise ValueError(
+                f"DataFrames must have the same columns for vstack. "
+                f"Self: {set(self._columns)}, Other: {set(other._columns)}"
+            )
+        
+        # Use existing row concatenation logic
+        return self._concat_rows(other, ignore_index=False)
+    
+    def hstack(self, columns: Union[List, 'DataFrame'], *, in_place: bool = False) -> 'DataFrame':
+        """
+        Return a new DataFrame grown horizontally by stacking multiple Series to it.
+        
+        This is a Polars-compatible method that performs horizontal concatenation.
+        Note: JAXFrame doesn't have Series objects, so this accepts a DataFrame or list of arrays.
+        
+        Args:
+            columns: DataFrame or list of arrays/lists to stack horizontally
+            in_place: If True, modifies this DataFrame in place (not supported, raises error)
+            
+        Returns:
+            New DataFrame with columns stacked horizontally
+            
+        Raises:
+            TypeError: If columns is not a DataFrame or list
+            ValueError: If arrays have incompatible lengths
+            NotImplementedError: If in_place=True (JAXFrame is immutable)
+        """
+        if in_place:
+            raise NotImplementedError("JAXFrame DataFrames are immutable, in_place=True not supported")
+        
+        if isinstance(columns, DataFrame):
+            # Use existing column concatenation logic
+            return self._concat_columns(columns)
+        elif isinstance(columns, list):
+            # Convert list of arrays to DataFrame first
+            if not columns:
+                return self  # Nothing to stack
+            
+            # Create column names for the arrays
+            new_data = {}
+            for i, arr in enumerate(columns):
+                col_name = f"column_{i}"
+                # Ensure it doesn't conflict with existing columns
+                while col_name in self._columns:
+                    col_name = f"column_{i}_{len(new_data)}"
+                new_data[col_name] = arr
+            
+            other_df = DataFrame(new_data)
+            return self._concat_columns(other_df)
+        else:
+            raise TypeError("columns must be a DataFrame or list of arrays")
+    
+    def with_columns(self, *exprs, **named_exprs) -> 'DataFrame':
+        """
+        Add columns to this DataFrame.
+        
+        This is a Polars-compatible method. Note that JAXFrame doesn't support expressions,
+        so this method accepts new column data directly.
+        
+        Args:
+            *exprs: Column data as positional arguments (dict or key-value pairs)
+            **named_exprs: Column data as keyword arguments (name=data)
+            
+        Returns:
+            New DataFrame with the columns added
+            
+        Examples:
+            >>> df.with_columns({'new_col': [1, 2, 3]})
+            >>> df.with_columns(new_col=[1, 2, 3])
+            >>> df.with_columns({'col1': [1, 2]}, col2=[3, 4])
+        """
+        new_data = self._data.copy()
+        
+        # Process positional arguments
+        for expr in exprs:
+            if isinstance(expr, dict):
+                new_data.update(expr)
+            else:
+                raise TypeError("Positional arguments must be dictionaries mapping column names to data")
+        
+        # Process keyword arguments
+        new_data.update(named_exprs)
+        
+        return DataFrame(new_data, name=self._name)
+    
+    def drop(self, *columns: str, strict: bool = True) -> 'DataFrame':
+        """
+        Remove columns from the dataframe.
+        
+        This is a Polars-compatible method.
+        
+        Args:
+            *columns: Names of the columns to remove
+            strict: If True, raise error if column doesn't exist
+            
+        Returns:
+            New DataFrame with specified columns removed
+            
+        Raises:
+            KeyError: If strict=True and a column doesn't exist
+        """
+        if not columns:
+            return self  # Nothing to drop
+        
+        # Flatten if a single list was passed
+        if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
+            columns = columns[0]
+        
+        new_data = {}
+        dropped_columns = set(columns)
+        
+        # Check for non-existent columns if strict mode
+        if strict:
+            missing_cols = dropped_columns - set(self._columns)
+            if missing_cols:
+                raise KeyError(f"Columns {missing_cols} not found in DataFrame")
+        
+        # Copy all columns except the ones to drop
+        for col_name, col_data in self._data.items():
+            if col_name not in dropped_columns:
+                new_data[col_name] = col_data
+        
+        return DataFrame(new_data, name=self._name)
+    
+    def filter(self, *predicates, **constraints) -> 'DataFrame':
+        """
+        Filter rows, retaining those that match the given predicate.
+        
+        This is a Polars-compatible method. Note that JAXFrame doesn't support expressions,
+        so this method accepts boolean arrays/lists or simple column value constraints.
+        
+        Args:
+            *predicates: Boolean arrays/lists indicating which rows to keep
+            **constraints: Column filters using name=value syntax
+            
+        Returns:
+            New DataFrame with filtered rows
+            
+        Examples:
+            >>> df.filter([True, False, True])  # Keep rows 0 and 2
+            >>> df.filter(name='Alice')  # Keep rows where name column equals 'Alice'
+            >>> df.filter(age=25, city='NYC')  # Keep rows where age=25 AND city='NYC'
+        """
+        if not predicates and not constraints:
+            return self  # No filtering
+        
+        # Start with all rows selected
+        mask = np.ones(self._length, dtype=bool)
+        
+        # Apply predicates (boolean arrays)
+        for predicate in predicates:
+            if isinstance(predicate, (list, tuple)):
+                predicate = np.array(predicate)
+            
+            if not isinstance(predicate, np.ndarray) or predicate.dtype != bool:
+                raise TypeError("Predicates must be boolean arrays/lists")
+            
+            if len(predicate) != self._length:
+                raise ValueError(f"Predicate length {len(predicate)} doesn't match DataFrame length {self._length}")
+            
+            mask = mask & predicate
+        
+        # Apply constraints (column=value filters)
+        for col_name, value in constraints.items():
+            if col_name not in self._columns:
+                raise KeyError(f"Column '{col_name}' not found")
+            
+            col_data = self._data[col_name]
+            
+            # Create boolean mask for this constraint
+            if isinstance(col_data, list):
+                col_mask = np.array([x == value for x in col_data])
+            else:
+                col_mask = col_data == value
+            
+            mask = mask & col_mask
+        
+        # Apply the mask to filter rows
+        new_data = {}
+        for col_name, col_data in self._data.items():
+            if isinstance(col_data, list):
+                new_data[col_name] = [col_data[i] for i in range(len(col_data)) if mask[i]]
+            else:
+                new_data[col_name] = col_data[mask]
+        
+        return DataFrame(new_data, name=self._name)

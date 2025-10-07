@@ -995,3 +995,36 @@ def test_concat_non_dataframe():
     
     with pytest.raises(TypeError, match="Can only concatenate with another DataFrame"):
         df1.concat("not a dataframe")
+
+
+def test_polars_api_compatibility():
+    """Test Polars-like API features for compatibility."""
+    # Create test DataFrame with mixed data types
+    data = {
+        'strings': ['a', 'b', 'c'],
+        'integers': [1, 2, 3],
+        'floats': [1.1, 2.2, 3.3],
+        'numpy_ints': np.array([10, 20, 30]),
+        'numpy_floats': np.array([1.5, 2.5, 3.5])
+    }
+    df = DataFrame(data)
+    
+    # Test dtypes property (not method) - Polars compatibility
+    dtypes_result = df.dtypes
+    assert isinstance(dtypes_result, dict)
+    assert dtypes_result['strings'] == 'list[str]'
+    assert dtypes_result['integers'] == 'list[int]'
+    assert dtypes_result['floats'] == 'list[float]'
+    assert dtypes_result['numpy_ints'] == 'int64'
+    assert dtypes_result['numpy_floats'] == 'float64'
+    
+    # Test schema property - Polars compatibility  
+    schema_result = df.schema
+    assert isinstance(schema_result, dict)
+    assert schema_result == dtypes_result  # Should be identical to dtypes
+    
+    # Verify dtypes and schema are properties, not methods
+    assert hasattr(DataFrame, 'dtypes')
+    assert hasattr(DataFrame, 'schema')
+    assert isinstance(getattr(DataFrame, 'dtypes'), property)
+    assert isinstance(getattr(DataFrame, 'schema'), property)

@@ -9,8 +9,8 @@ from src.jaxframe import DataFrame
 class TestImprovedPrinting:
     """Test class for improved DataFrame printing features."""
     
-    def test_dtypes_method(self):
-        """Test the new dtypes() method."""
+    def test_dtypes_property(self):
+        """Test the dtypes property (changed from method to match Polars)."""
         data = {
             'str_col': ['a', 'b', 'c'],
             'int_col': [1, 2, 3],
@@ -19,7 +19,7 @@ class TestImprovedPrinting:
             'numpy_float': np.array([1.5, 2.5, 3.5])
         }
         df = DataFrame(data)
-        dtypes = df.dtypes()
+        dtypes = df.dtypes  # Now a property, not a method
         
         assert isinstance(dtypes, dict)
         assert dtypes['str_col'] == 'list[str]'
@@ -27,6 +27,24 @@ class TestImprovedPrinting:
         assert dtypes['float_col'] == 'list[float]'
         assert dtypes['numpy_int'] == 'int64'
         assert dtypes['numpy_float'] == 'float64'
+    
+    def test_schema_property(self):
+        """Test the schema property (alias for dtypes to match Polars)."""
+        data = {
+            'str_col': ['a', 'b', 'c'],
+            'int_col': [1, 2, 3],
+            'numpy_array': np.array([1.0, 2.0, 3.0])
+        }
+        df = DataFrame(data)
+        schema = df.schema
+        
+        assert isinstance(schema, dict)
+        assert schema['str_col'] == 'list[str]'
+        assert schema['int_col'] == 'list[int]'
+        assert schema['numpy_array'] == 'float64'
+        
+        # Verify schema is identical to dtypes
+        assert schema == df.dtypes
     
     def test_improved_repr_without_quotes_for_numerics(self):
         """Test that numeric values don't have quotes in repr."""
