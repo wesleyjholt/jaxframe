@@ -830,286 +830,253 @@ class DataFrame:
 
         return pd.DataFrame(data)
     
-    def join(self, other: 'DataFrame', on: Union[str, List[str]], 
-             source: Union[str, List[str], None] = None, 
-             target: Union[str, List[str], None] = None,
-             how: str = 'inner') -> 'DataFrame':
+    def join(self, other: 'DataFrame', 
+             on: Union[str, List[str], None] = None,
+             how: str = 'inner',
+             *,
+             left_on: Union[str, List[str], None] = None,
+             right_on: Union[str, List[str], None] = None,
+             suffix: str = '_right') -> 'DataFrame':
         """
-        Join this DataFrame with another DataFrame.
+        Join in SQL-like fashion.
         
         Args:
-            other: The DataFrame to join with
-            on: The column name(s) to join on (must exist in both DataFrames).
-               Can be a string for single column or list of strings for multi-column joins.
-            source: The column name(s) in the other DataFrame to copy values from.
-                   Can be a string for single column or list of strings for multiple columns.
-                   Required for 'inner' joins, ignored for 'semi' joins.
-            target: The name(s) for the new column(s) in the result. If None, 
-                   defaults to '{other.name}/{source}' if other has a name,
-                   otherwise just source. Can be a string for single column,
-                   list of strings for multiple columns, or None for auto-naming.
-                   Ignored for 'semi' joins.
-            how: Type of join to perform. Options:
-                - 'inner': Inner join that adds columns from other DataFrame (default)
-                - 'semi': Semi-join that filters rows based on existence of matches
-                         but only returns columns from this DataFrame
+            other: DataFrame to join with
+            on: Name(s) of the join columns in both DataFrames
+            how: Join strategy. Options:
+                - 'inner': Returns rows that have matching values in both tables (default)
+                - 'left': Returns all rows from the left table, and matched rows from right table
+                - 'full': Returns all rows when there is a match in either left or right table
+                - 'semi': Filter rows that have a match in the right table
+                - 'anti': Filter rows that do not have a match in the right table
+                - 'cross': Returns the Cartesian product of rows from both tables
+            left_on: Name(s) of the left join column(s). Cannot be used with 'on'
+            right_on: Name(s) of the right join column(s). Cannot be used with 'on'
+            suffix: Suffix to append to columns with a duplicate name
         
         Returns:
             A new DataFrame with the joined data
             
         Raises:
-            KeyError: If on doesn't exist in both DataFrames or source column(s) 
-                     don't exist in other DataFrame
-            ValueError: If there are duplicate values in the on column of other DataFrame,
-                       or if target list length doesn't match source list length,
-                       or if how is not 'inner' or 'semi', or if source is required but not provided
+            ValueError: If join parameters are invalid or unsupported join type
+            KeyError: If join columns don't exist in the DataFrames
         """
         from typing import Union, List
         
         # Validate how parameter
-        if how not in ['inner', 'semi']:
-            raise ValueError(f"'how' must be 'inner' or 'semi', got '{how}'")
+        valid_strategies = {'inner', 'left', 'full', 'semi', 'anti', 'cross'}
+        if how not in valid_strategies:
+            raise ValueError(f"'how' must be one of {valid_strategies}, got '{how}'")
         
-        # For semi joins, source and target are ignored
-        if how == 'semi':
-            source_columns = []
-            target_columns = []
-        else:
-            # For inner joins, source is required
-            if source is None:
-                raise ValueError("'source' parameter is required for inner joins")
-            
-            # Normalize inputs to lists
-            if isinstance(source, str):
-                source_columns = [source]
-            else:
-                source_columns = source
-                
-            if target is None:
-                target_columns = None
-            elif isinstance(target, str):
-                target_columns = [target]
-            else:
-                target_columns = target
-                
-            # Validate target_columns length if provided
-            if target_columns is not None and len(target_columns) != len(source_columns):
-                raise ValueError(f"Length of target list ({len(target_columns)}) must match "
-                               f"length of source list ({len(source_columns)})")
+        # Validate join column parameters
+        if on is not None and (left_on is not None or right_on is not None):
+            raise ValueError("Cannot specify both 'on' and 'left_on'/'right_on'")
         
-        # Normalize on parameter to list
-        if isinstance(on, str):
-            on_columns = [on]
+        if on is None and (left_on is None or right_on is None):
+            raise ValueError("Must specify either 'on' or both 'left_on' and 'right_on'")
+        
+        # Determine join columns
+        if on is not None:
+            # Both sides use the same column names
+            left_columns = [on] if isinstance(on, str) else list(on)
+            right_columns = left_columns.copy()
         else:
-            on_columns = on
-            
+            # Different column names for each side
+            left_columns = [left_on] if isinstance(left_on, str) else list(left_on)
+            right_columns = [right_on] if isinstance(right_on, str) else list(right_on)
+        
+        if len(left_columns) != len(right_columns):
+            raise ValueError("Left and right join columns must have the same length")
+        
         # Validate join columns exist
-        for col in on_columns:
+        for col in left_columns:
             if col not in self.columns:
                 raise KeyError(f"Column '{col}' not found in left DataFrame")
+        
+        for col in right_columns:
             if col not in other.columns:
                 raise KeyError(f"Column '{col}' not found in right DataFrame")
         
-        # For inner joins, validate source columns
-        if how == 'inner':
-            for src_col in source_columns:
-                if src_col not in other._columns:
-                    raise KeyError(f"Column '{src_col}' not found in other DataFrame")
+        # Check for unsupported join types
+        if how in ['left', 'full', 'cross']:
+            raise NotImplementedError(f"Join strategy '{how}' is not yet implemented in JAXFrame")
         
-        # Handle semi-join case (exists functionality)
-        if how == 'semi':
-            # Create lookup set from other DataFrame for existence check
-            # For multi-column joins, create tuples of values
-            if len(on_columns) == 1:
-                col = on_columns[0]
-                other_keys = set(other[col])
-            else:
-                # Create tuples for multi-column keys
-                other_keys = set()
-                for i in range(len(other)):
-                    key_tuple = tuple(other[col][i] for col in on_columns)
-                    other_keys.add(key_tuple)
-            
-            # Find matching rows in this DataFrame (preserving order, eliminating duplicates)
-            matching_indices = []
-            seen_keys = set()
-            
-            for i in range(len(self)):
-                if len(on_columns) == 1:
-                    col = on_columns[0]
-                    key = self[col][i]
-                else:
-                    key = tuple(self[col][i] for col in on_columns)
+        # Determine which columns from the right DataFrame to include
+        right_columns_to_add = []
+        right_column_names = []
+        
+        for col in other.columns:
+            if col not in right_columns or how in ['inner']:  # Always include non-join columns for inner joins
+                # Handle column name conflicts with suffix
+                new_col_name = col
+                if col in self.columns and col not in left_columns:
+                    new_col_name = f"{col}{suffix}"
+                elif col in self.columns and col in left_columns:
+                    # For join columns, don't duplicate unless it's a different name
+                    if on is None:  # left_on != right_on case
+                        new_col_name = f"{col}{suffix}"
+                    else:
+                        continue  # Skip duplicate join column for 'on' case
                 
-                # Check if key exists in other DataFrame and we haven't seen this key yet
-                if key in other_keys and key not in seen_keys:
-                    matching_indices.append(i)
-                    seen_keys.add(key)
+                right_columns_to_add.append(col)
+                right_column_names.append(new_col_name)
+        
+        # Handle semi-join case
+        if how == 'semi':
+            return self._semi_join(other, left_columns, right_columns)
+        
+        # Handle anti-join case
+        if how == 'anti':
+            return self._anti_join(other, left_columns, right_columns)
+        
+        # Handle inner join case
+        if how == 'inner':
+            return self._inner_join(other, left_columns, right_columns, right_columns_to_add, right_column_names)
+        
+        # Should not reach here
+        raise ValueError(f"Unsupported join strategy: {how}")
+    
+    def _semi_join(self, other: 'DataFrame', left_columns: List[str], right_columns: List[str]) -> 'DataFrame':
+        """Perform a semi-join (filter rows that have a match in the right table)."""
+        # Create lookup set from other DataFrame for existence check
+        other_keys = set()
+        for i in range(len(other)):
+            if len(right_columns) == 1:
+                key = other[right_columns[0]][i]
+            else:
+                key = tuple(other[right_columns[j]][i] for j in range(len(right_columns)))
+            other_keys.add(key)
+        
+        # Find matching rows in this DataFrame
+        matching_indices = []
+        seen_keys = set()
+        
+        for i in range(len(self)):
+            if len(left_columns) == 1:
+                key = self[left_columns[0]][i]
+            else:
+                key = tuple(self[left_columns[j]][i] for j in range(len(left_columns)))
             
-            # Return subset of this DataFrame with only matching rows
-            if not matching_indices:
-                # Return empty DataFrame with same structure
-                empty_data = {}
+            # Check if key exists in other DataFrame and we haven't seen this key yet
+            if key in other_keys and key not in seen_keys:
+                matching_indices.append(i)
+                seen_keys.add(key)
+        
+        # Return subset of this DataFrame with only matching rows
+        return self._filter_by_indices(matching_indices)
+    
+    def _anti_join(self, other: 'DataFrame', left_columns: List[str], right_columns: List[str]) -> 'DataFrame':
+        """Perform an anti-join (filter rows that do not have a match in the right table)."""
+        # Create lookup set from other DataFrame
+        other_keys = set()
+        for i in range(len(other)):
+            if len(right_columns) == 1:
+                key = other[right_columns[0]][i]
+            else:
+                key = tuple(other[right_columns[j]][i] for j in range(len(right_columns)))
+            other_keys.add(key)
+        
+        # Find non-matching rows in this DataFrame
+        non_matching_indices = []
+        
+        for i in range(len(self)):
+            if len(left_columns) == 1:
+                key = self[left_columns[0]][i]
+            else:
+                key = tuple(self[left_columns[j]][i] for j in range(len(left_columns)))
+            
+            # Check if key does not exist in other DataFrame
+            if key not in other_keys:
+                non_matching_indices.append(i)
+        
+        # Return subset of this DataFrame with only non-matching rows
+        return self._filter_by_indices(non_matching_indices)
+    
+    def _inner_join(self, other: 'DataFrame', left_columns: List[str], right_columns: List[str], 
+                   right_columns_to_add: List[str], right_column_names: List[str]) -> 'DataFrame':
+        """Perform an inner join."""
+        # Build lookup from right DataFrame
+        right_lookup = {}
+        for i in range(len(other)):
+            if len(right_columns) == 1:
+                key = other[right_columns[0]][i]
+            else:
+                key = tuple(other[right_columns[j]][i] for j in range(len(right_columns)))
+            
+            # Store all column values for this key
+            right_lookup[key] = {}
+            for col in right_columns_to_add:
+                right_lookup[key][col] = other[col][i]
+        
+        # Find matching rows and collect data
+        result_data = {}
+        
+        # Initialize result columns from left DataFrame
+        for col in self.columns:
+            result_data[col] = []
+        
+        # Initialize result columns from right DataFrame
+        for col_name in right_column_names:
+            result_data[col_name] = []
+        
+        # Process each row from left DataFrame
+        for i in range(len(self)):
+            if len(left_columns) == 1:
+                key = self[left_columns[0]][i]
+            else:
+                key = tuple(self[left_columns[j]][i] for j in range(len(left_columns)))
+            
+            # Check if key exists in right DataFrame
+            if key in right_lookup:
+                # Add left DataFrame values
                 for col in self.columns:
-                    if self.column_types[col] == 'list':
-                        empty_data[col] = []
-                    elif self.column_types[col] == 'jax_array':
-                        try:
-                            import jax.numpy as jnp
-                            empty_data[col] = jnp.array([], dtype=self._data[col].dtype)
-                        except ImportError:
-                            import numpy as np
-                            empty_data[col] = np.array([], dtype=self._data[col].dtype)
-                    else:  # numpy array
-                        import numpy as np
-                        empty_data[col] = np.array([], dtype=self._data[col].dtype)
-                return DataFrame(empty_data, name=self.name)
-            
-            # Create new data dictionary with matching rows
-            new_data = {}
+                    result_data[col].append(self[col][i])
+                
+                # Add right DataFrame values
+                for src_col, target_col in zip(right_columns_to_add, right_column_names):
+                    result_data[target_col].append(right_lookup[key][src_col])
+        
+        return DataFrame(result_data, name=self.name)
+    
+    def _filter_by_indices(self, indices: List[int]) -> 'DataFrame':
+        """Helper method to create a new DataFrame with only the specified row indices."""
+        if not indices:
+            # Return empty DataFrame with same structure
+            empty_data = {}
             for col in self.columns:
                 if self.column_types[col] == 'list':
-                    new_data[col] = [self._data[col][i] for i in matching_indices]
+                    empty_data[col] = []
                 elif self.column_types[col] == 'jax_array':
-                    # For JAX arrays, use advanced indexing
                     try:
                         import jax.numpy as jnp
-                        new_data[col] = self._data[col][jnp.array(matching_indices)]
+                        empty_data[col] = jnp.array([], dtype=self._data[col].dtype)
                     except ImportError:
-                        # JAX not available, fall back to numpy
                         import numpy as np
-                        new_data[col] = self._data[col][matching_indices]
+                        empty_data[col] = np.array([], dtype=self._data[col].dtype)
                 else:  # numpy array
                     import numpy as np
-                    new_data[col] = self._data[col][matching_indices]
-            
-            return DataFrame(new_data, name=self.name)
+                    empty_data[col] = np.array([], dtype=self._data[col].dtype)
+            return DataFrame(empty_data, name=self.name)
         
-        # Handle inner join case (original functionality)
-        # Use single column for backward compatibility validation
-        on_single = on_columns[0] if len(on_columns) == 1 else on_columns
-        
-        # Check for duplicates in the join column(s) of other DataFrame
-        if len(on_columns) == 1:
-            other_join_values = other[on_columns[0]]
-            if len(set(other_join_values)) != len(other_join_values):
-                raise ValueError(f"Duplicate values found in '{on_columns[0]}' column of other DataFrame")
-        else:
-            # For multi-column joins, check for duplicate key combinations
-            other_key_tuples = []
-            for i in range(len(other)):
-                key_tuple = tuple(other[col][i] for col in on_columns)
-                other_key_tuples.append(key_tuple)
-            if len(set(other_key_tuples)) != len(other_key_tuples):
-                raise ValueError(f"Duplicate key combinations found in join columns {on_columns} of other DataFrame")
-        
-        # Create lookup dictionaries from other DataFrame for each source column
-        lookups = {}
-        for src_col in source_columns:
-            lookups[src_col] = {}
-            for i in range(len(other)):
-                if len(on_columns) == 1:
-                    key = other._data[on_columns[0]][i]
-                else:
-                    key = tuple(other._data[col][i] for col in on_columns)
-                value = other._data[src_col][i]
-                lookups[src_col][key] = value
-        
-        # Determine target column names
-        if target_columns is None:
-            target_columns = []
-            for src_col in source_columns:
-                if other._name:
-                    target_columns.append(f"{other._name}/{src_col}")
-                else:
-                    target_columns.append(src_col)
-        
-        # Create new data with joined columns
+        # Create new data dictionary with matching rows
         new_data = {}
-        
-        # First, determine which rows from the left DataFrame should be included (inner join)
-        valid_indices = []  # Indices of rows that will be included in the result
-        
-        # Find all indices where the join key exists in the right DataFrame
-        for i in range(len(self)):
-            if len(on_columns) == 1:
-                key = self._data[on_columns[0]][i]
-            else:
-                key = tuple(self._data[col][i] for col in on_columns)
-            
-            # Check if key exists in lookup (use first source column's lookup for key existence check)
-            if source_columns and key in lookups[source_columns[0]]:
-                valid_indices.append(i)
-        
-        # Copy existing columns but only for valid indices
-        for col in self._columns:
-            if self._column_types[col] == 'list':
-                new_data[col] = [self._data[col][i] for i in valid_indices]
-            elif self._column_types[col] == 'jax_array':
-                # For JAX arrays, use advanced indexing to avoid list conversion
+        for col in self.columns:
+            if self.column_types[col] == 'list':
+                new_data[col] = [self._data[col][i] for i in indices]
+            elif self.column_types[col] == 'jax_array':
+                # For JAX arrays, use advanced indexing
                 try:
                     import jax.numpy as jnp
-                    if valid_indices:
-                        new_data[col] = self._data[col][jnp.array(valid_indices)]
-                    else:
-                        # Empty result - create empty array with same dtype
-                        new_data[col] = jnp.array([], dtype=self._data[col].dtype)
+                    new_data[col] = self._data[col][jnp.array(indices)]
                 except ImportError:
                     # JAX not available, fall back to numpy
                     import numpy as np
-                    if valid_indices:
-                        new_data[col] = self._data[col][valid_indices]
-                    else:
-                        new_data[col] = np.array([], dtype=self._data[col].dtype)
+                    new_data[col] = self._data[col][np.array(indices)]
             else:  # numpy array
                 import numpy as np
-                if valid_indices:
-                    new_data[col] = self._data[col][valid_indices]
-                else:
-                    new_data[col] = np.array([], dtype=self._data[col].dtype)
+                new_data[col] = self._data[col][np.array(indices)]
         
-        # Add the joined columns
-        for src_col, target_col in zip(source_columns, target_columns):
-            lookup = lookups[src_col]
-            joined_values = []
-            
-            # Only process valid indices
-            for i in valid_indices:
-                if len(on_columns) == 1:
-                    key = self._data[on_columns[0]][i]
-                else:
-                    key = tuple(self._data[col][i] for col in on_columns)
-                joined_values.append(lookup[key])
-            
-            # Preserve the type from the source column
-            if other._column_types[src_col] == 'list':
-                new_data[target_col] = joined_values
-            elif other._column_types[src_col] == 'jax_array':
-                # For JAX arrays, convert efficiently without intermediate list conversion
-                try:
-                    import jax.numpy as jnp
-                    if joined_values:
-                        new_data[target_col] = jnp.array(joined_values)
-                    else:
-                        # Empty result - create empty array with same dtype as source
-                        new_data[target_col] = jnp.array([], dtype=other._data[src_col].dtype)
-                except ImportError:
-                    # JAX not available, fall back to numpy
-                    import numpy as np
-                    if joined_values:
-                        new_data[target_col] = np.asarray(joined_values)
-                    else:
-                        new_data[target_col] = np.array([], dtype=other._data[src_col].dtype)
-            else:  # numpy array
-                import numpy as np
-                if joined_values:
-                    new_data[target_col] = np.asarray(joined_values)
-                else:
-                    new_data[target_col] = np.array([], dtype=other._data[src_col].dtype)
-        
-        # Create new DataFrame with updated name
-        new_name = f"{self._name}_joined" if self._name else None
-        return DataFrame(new_data, name=new_name)
+        return DataFrame(new_data, name=self.name)
     
     def add_column(self, column_name: str, values: Union[List, np.ndarray, Any], 
                    column_type: Optional[Union[str, ColumnType]] = None) -> 'DataFrame':
