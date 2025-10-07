@@ -4,6 +4,7 @@ Optimized for JAX compatibility with fast constructors and minimal copying.
 """
 from typing import Dict, Any, Union, List, Tuple, Optional, Literal
 import numpy as np
+import os
 from enum import Enum
 
 class ColumnType(Enum):
@@ -289,6 +290,274 @@ class DataFrame:
     def __contains__(self, key: str) -> bool:
         """Check if a column exists in the DataFrame."""
         return key in self._data
+    
+    def _parse_env_limit(self, env_name: str, default: int) -> Optional[int]:
+        """Parse an environment variable into a non-negative integer.
+        
+        Negative values are treated as None meaning "no limit".
+        """
+        val = os.getenv(env_name)
+        if val is None or val == "":
+            return default
+        try:
+            n = int(val)
+            if n < 0:
+                return None  # unlimited
+            return n
+        except ValueError:
+            return default
+    
+    def _truncate_str(self, s: str, limit: Optional[int]) -> str:
+        """Truncate a string to limit characters with an ellipsis."""
+        if limit is None or len(s) <= limit:
+            return s
+        return s[:limit] + "…"
+    
+    def _format_value(self, value: Any, str_limit: Optional[int]) -> str:
+        """Format a value for display, handling different data types."""
+        if isinstance(value, (int, float)):
+            if isinstance(value, float):
+                formatted = f"{value:.3f}"
+            else:
+                formatted = str(value)
+        else:
+            # Handle numpy/JAX scalars
+            try:
+                import numpy as np
+                if isinstance(value, np.integer):
+                    formatted = str(int(value))
+                elif isinstance(value, np.floating):
+                    formatted = f"{float(value):.3f}"
+                else:
+                    # Handle JAX arrays/scalars
+                    try:
+                        import jax
+                        import jax.core
+                        if hasattr(value, 'dtype') and (
+                            str(type(value)).startswith('<class \'jaxlib.') or
+                            str(type(value).__module__).startswith('jax') or
+                            (hasattr(value, '__module__') and str(value.__module__).startswith('jax'))):
+                            
+                            if isinstance(value, jax.core.Tracer):
+                                dtype_str = str(value.dtype) if hasattr(value, 'dtype') else 'unknown'
+                                formatted = f"<tracer:{dtype_str}>"
+                            else:
+                                try:
+                                    scalar_value = float(value) if 'float' in str(value.dtype) else int(value)
+                                    if isinstance(scalar_value, float):
+                                        formatted = f"{scalar_value:.3f}"
+                                    else:
+                                        formatted = str(scalar_value)
+                                except (jax.errors.ConcretizationTypeError, AttributeError):
+                                    dtype_str = str(value.dtype) if hasattr(value, 'dtype') else 'unknown'
+                                    formatted = f"<jax:{dtype_str}>"
+                        else:
+                            formatted = str(value)
+                    except ImportError:
+                        formatted = str(value)
+            except ImportError:
+                formatted = str(value)
+        
+        return self._truncate_str(formatted, str_limit)
+    
+    def _get_dtype_str(self, col_name: str) -> str:
+        """Get a short dtype string for a column."""
+        col_type = self._column_types[col_name]
+        data = self._data[col_name]
+        
+        if col_type == ColumnType.JAX_ARRAY.value:
+            try:
+                import jax.numpy as jnp
+                if hasattr(data, 'dtype'):
+                    dtype = str(data.dtype)
+                    # Simplify dtype names
+                    if dtype.startswith('float'):
+                        return 'f' + dtype.replace('float', '')
+                    elif dtype.startswith('int'):
+                        return 'i' + dtype.replace('int', '')
+                    elif dtype.startswith('bool'):
+                        return 'bool'
+                    return dtype
+                return 'jax'
+            except ImportError:
+                return 'jax'
+        elif col_type == ColumnType.NUMPY_ARRAY.value:
+            try:
+                import numpy as np
+                if hasattr(data, 'dtype'):
+                    dtype = str(data.dtype)
+                    # Simplify dtype names  
+                    if dtype.startswith('float'):
+                        return 'f' + dtype.replace('float', '')
+                    elif dtype.startswith('int'):
+                        return 'i' + dtype.replace('int', '')
+                    elif dtype.startswith('bool'):
+                        return 'bool'
+                    return dtype
+                return 'array'
+            except ImportError:
+                return 'array'
+        else:  # LIST
+            if len(data) > 0:
+                first_val = data[0]
+                if isinstance(first_val, str):
+                    return 'str'
+                elif isinstance(first_val, bool):
+                    return 'bool'
+                elif isinstance(first_val, int):
+                    return 'i64'
+                elif isinstance(first_val, float):
+                    return 'f64'
+            return 'list'
+    
+    def to_string(self,
+                  max_rows: Optional[int] = None,
+                  max_cols: Optional[int] = None, 
+                  str_limit: Optional[int] = None,
+                  show_shape: bool = True) -> str:
+        """Return a Polars-like string representation of the DataFrame.
+        
+        Args:
+            max_rows: Maximum rows to display (None = unlimited)
+            max_cols: Maximum columns to display (None = unlimited)  
+            str_limit: Maximum characters per cell (None = unlimited)
+            show_shape: Whether to show shape information
+            
+        Returns:
+            Formatted string representation
+        """
+        # Use environment variables or defaults
+        if max_rows is None:
+            max_rows = self._parse_env_limit("POLARS_FMT_MAX_ROWS", 10)
+        if max_cols is None:
+            max_cols = self._parse_env_limit("POLARS_FMT_MAX_COLS", 8)
+        if str_limit is None:
+            str_limit = self._parse_env_limit("POLARS_FMT_STR_LEN", 30)
+            
+        n_rows = self._length
+        n_cols = len(self._columns)
+        
+        if n_rows == 0:
+            if show_shape:
+                return f"shape: (0, {n_cols})\n┌─┐\n│ │\n└─┘"
+            return "┌─┐\n│ │\n└─┘"
+        
+        # Determine column display strategy
+        if max_cols is None or n_cols <= max_cols:
+            n_first_cols = n_cols
+            n_last_cols = 0
+            reduce_cols = False
+        else:
+            n_first_cols = (max_cols + 1) // 2
+            n_last_cols = max_cols // 2
+            reduce_cols = True
+        
+        # Prepare headers with dtype info
+        headers = []
+        dtypes = []
+        selected_columns = []
+        
+        # First columns
+        for col in self._columns[:n_first_cols]:
+            headers.append(self._truncate_str(col, str_limit))
+            dtypes.append(self._get_dtype_str(col))
+            selected_columns.append(col)
+        
+        # Ellipsis column
+        if reduce_cols:
+            headers.append("…")
+            dtypes.append("…")
+            selected_columns.append("…")
+        
+        # Last columns
+        for col in self._columns[n_cols - n_last_cols:]:
+            headers.append(self._truncate_str(col, str_limit))
+            dtypes.append(self._get_dtype_str(col))
+            selected_columns.append(col)
+        
+        # Determine rows to display
+        if max_rows is None or n_rows <= max_rows or max_rows <= 0:
+            row_indices = list(range(n_rows))
+            insert_ellipsis_row = False
+        else:
+            half = max_rows // 2
+            rest = max_rows % 2
+            top_range = list(range(half + rest))
+            bottom_range = list(range(n_rows - half, n_rows))
+            row_indices = top_range + [-1] + bottom_range
+            insert_ellipsis_row = True
+        
+        # Build data matrix
+        data_matrix = []
+        for idx in row_indices:
+            if idx == -1 and insert_ellipsis_row:
+                data_matrix.append(["…"] * len(headers))
+                continue
+                
+            row_data = []
+            # First columns
+            for col in self._columns[:n_first_cols]:
+                value = self._data[col][idx]
+                row_data.append(self._format_value(value, str_limit))
+            
+            # Ellipsis column
+            if reduce_cols:
+                row_data.append("…")
+            
+            # Last columns  
+            for col in self._columns[n_cols - n_last_cols:]:
+                value = self._data[col][idx]
+                row_data.append(self._format_value(value, str_limit))
+                
+            data_matrix.append(row_data)
+        
+        # Calculate column widths
+        col_widths = []
+        for i in range(len(headers)):
+            max_width = max(len(headers[i]), len(dtypes[i]))
+            for row in data_matrix:
+                max_width = max(max_width, len(row[i]))
+            col_widths.append(max_width)
+        
+        # Build the table
+        lines = []
+        
+        if show_shape:
+            lines.append(f"shape: ({n_rows}, {n_cols})")
+        
+        # Top border
+        top_line = "┌" + "┬".join("─" * (w + 2) for w in col_widths) + "┐"
+        lines.append(top_line)
+        
+        # Header row
+        header_cells = [f" {headers[i].ljust(col_widths[i])} " for i in range(len(headers))]
+        header_line = "│" + "│".join(header_cells) + "│"
+        lines.append(header_line)
+        
+        # Dtype row
+        dtype_cells = [f" {dtypes[i].ljust(col_widths[i])} " for i in range(len(dtypes))]
+        dtype_line = "│" + "│".join(dtype_cells) + "│"
+        lines.append(dtype_line)
+        
+        # Header separator
+        sep_line = "╞" + "╪".join("═" * (w + 2) for w in col_widths) + "╡"
+        lines.append(sep_line)
+        
+        # Data rows
+        for row in data_matrix:
+            data_cells = [f" {row[i].ljust(col_widths[i])} " for i in range(len(row))]
+            data_line = "│" + "│".join(data_cells) + "│"
+            lines.append(data_line)
+        
+        # Bottom border
+        bottom_line = "└" + "┴".join("─" * (w + 2) for w in col_widths) + "┘"
+        lines.append(bottom_line)
+        
+        return "\n".join(lines)
+    
+    def __str__(self) -> str:
+        """String representation using Polars-like formatting."""
+        return self.to_string()
     
     def __repr__(self) -> str:
         """String representation of the DataFrame."""
