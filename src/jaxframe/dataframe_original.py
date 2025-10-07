@@ -1,16 +1,8 @@
 """
 A simple immutable DataFrame implementation using a dictionary of arrays and lists.
-Optimized for JAX compatibility with fast constructors and minimal copying.
 """
-from typing import Dict, Any, Union, List, Tuple, Optional, Literal
+from typing import Dict, Any, Union, List, Tuple
 import numpy as np
-from enum import Enum
-
-class ColumnType(Enum):
-    """Column type enumeration for fast type tracking."""
-    JAX_ARRAY = 'jax_array'
-    NUMPY_ARRAY = 'array'
-    LIST = 'list'
 
 
 class DataFrame:
@@ -20,19 +12,14 @@ class DataFrame:
     All arrays and lists must have the same length. Once created, the DataFrame cannot be modified.
     """
     
-    def __init__(self, 
-                 data: Dict[str, Union[List, np.ndarray]], 
-                 name: str = None,
-                 column_types: Optional[Dict[str, Union[str, ColumnType]]] = None,
-                 skip_validation: bool = False):
+    def __init__(self, data: Dict[str, Union[List, np.ndarray]], name: str = None):
         """
-        Initialize a DataFrame with optimized type detection and minimal copying.
+        Initialize a DataFrame with a dictionary of arrays and/or lists.
         
         Args:
             data: Dictionary where keys are column names and values are arrays/lists
-            name: Optional name for the DataFrame
-            column_types: Pre-computed column types (skips expensive detection)
-            skip_validation: Skip length validation for internal operations
+                 of the same length. Lists will be preserved as lists, arrays as arrays.
+            name: Optional name for the DataFrame. If not provided, defaults to None.
                  
         Raises:
             ValueError: If arrays/lists have different lengths or if data is empty.
@@ -44,147 +31,100 @@ class DataFrame:
         if not data:
             raise ValueError("Data dictionary cannot be empty")
         
+        # Store data preserving original types (lists vs arrays)
         self._data = {}
-        self._name = name
-        self._columns = tuple(data.keys())
+        self._column_types = {}  # Track whether each column is a list or array
+        lengths = []
         
-        # Fast path: use provided column types
-        if column_types is not None:
-            self._column_types = self._normalize_column_types(column_types)
-            self._process_data_fast_path(data)
-        else:
-            # Optimized type detection
-            self._column_types = {}
-            self._process_data_with_detection(data)
-        
-        # Get length from first column
-        self._length = self._get_length_fast()
-        
-        # Validate lengths only if requested
-        if not skip_validation:
-            self._validate_lengths()
-    
-    def _normalize_column_types(self, column_types: Dict[str, Union[str, ColumnType]]) -> Dict[str, str]:
-        """Convert column types to string format."""
-        normalized = {}
-        for col, ctype in column_types.items():
-            if isinstance(ctype, ColumnType):
-                normalized[col] = ctype.value
-            else:
-                normalized[col] = ctype
-        return normalized
-    
-    def _process_data_fast_path(self, data: Dict[str, Any]):
-        """Fast data processing when types are known."""
-        for column_name, values in data.items():
-            col_type = self._column_types[column_name]
-            
-            if col_type == ColumnType.JAX_ARRAY.value:
-                # JAX arrays are immutable - no copying needed
-                self._data[column_name] = values
-            elif col_type == ColumnType.NUMPY_ARRAY.value:
-                # Only copy if necessary for mutable numpy arrays
-                self._data[column_name] = values if hasattr(values, 'flags') and not values.flags.writeable else values.copy()
-            else:  # LIST
-                # Copy lists for safety
-                self._data[column_name] = values.copy() if isinstance(values, list) else list(values)
-    
-    def _process_data_with_detection(self, data: Dict[str, Any]):
-        """Optimized type detection using module checking."""
         for column_name, values in data.items():
             if not isinstance(column_name, str):
                 raise TypeError("Column names must be strings")
             
-            # Fast module-based type detection
-            col_type, processed_values = self._detect_type_optimized(values)
-            self._column_types[column_name] = col_type
-            self._data[column_name] = processed_values
-    
-    def _detect_type_optimized(self, values) -> Tuple[str, Any]:
-        """Optimized type detection using module checking instead of complex logic."""
-        # Fast path: check module directly
-        if hasattr(values, '__module__'):
-            module_str = str(values.__module__)
-            # Be more precise about JAX module detection
-            if module_str.startswith('jax') or '.jax' in module_str:
-                return ColumnType.JAX_ARRAY.value, values  # No copy for immutable JAX arrays
-            elif 'numpy' in module_str:
-                return ColumnType.NUMPY_ARRAY.value, values.copy()  # Copy numpy arrays
-        
-        # Handle lists
-        if isinstance(values, list):
-            # Check if list contains JAX elements (simplified check)
-            if values and hasattr(values[0], '__module__') and 'jax' in str(values[0].__module__):
+            if isinstance(values, list):
+                # Check if this is a list containing JAX arrays that should be converted
                 try:
                     import jax.numpy as jnp
-                    return ColumnType.JAX_ARRAY.value, jnp.array(values)
+                    import jax
+                    
+                    # Check if any elements in the list are JAX arrays/tracers/scalars
+                    has_jax_elements = any(
+                        hasattr(v, 'shape') and hasattr(v, 'dtype') and
+                        (hasattr(v, 'device') or 
+                         str(type(v)).startswith('<class \'jaxlib.') or
+                         isinstance(v, (jax.Array, jax.core.Tracer)) or
+                         str(type(v).__module__).startswith('jax'))
+                        for v in values if v is not None
+                    )
+                    
+                    if has_jax_elements and values:
+                        # Convert the entire list to a JAX array
+                        # This handles mixed lists with JAX scalars and Python values
+                        jax_array = jnp.array(values)
+                        self._data[column_name] = jax_array
+                        self._column_types[column_name] = 'jax_array'
+                        lengths.append(len(values))
+                    else:
+                        # Keep as regular list
+                        self._data[column_name] = values.copy()
+                        self._column_types[column_name] = 'list'
+                        lengths.append(len(values))
                 except ImportError:
-                    pass
-            return ColumnType.LIST.value, values.copy()
-        
-        # Handle numpy arrays
-        if isinstance(values, np.ndarray):
-            return ColumnType.NUMPY_ARRAY.value, values.copy()
-        
-        # Fallback: try to detect JAX arrays with precise checks
-        if hasattr(values, 'shape') and hasattr(values, 'dtype'):
-            try:
-                import jax
-                # Only classify as JAX if it's actually a JAX type
-                if isinstance(values, (jax.Array, jax.core.Tracer)):
-                    return ColumnType.JAX_ARRAY.value, values
-                # If has __array__ method, convert to numpy array
-                elif hasattr(values, '__array__'):
-                    return ColumnType.NUMPY_ARRAY.value, np.array(values)
-            except ImportError:
-                # If no JAX, treat as numpy array if it has __array__
-                if hasattr(values, '__array__'):
-                    return ColumnType.NUMPY_ARRAY.value, np.array(values)
-        
-        # Default: convert to list
-        return ColumnType.LIST.value, list(values)
-    
-    def _get_length_fast(self) -> int:
-        """Fast length detection from first column."""
-        if not self._data:
-            return 0
-        
-        first_value = next(iter(self._data.values()))
-        if hasattr(first_value, 'shape'):
-            return first_value.shape[0]
-        else:
-            return len(first_value)
-    
-    def _validate_lengths(self):
-        """Validate all columns have same length."""
-        lengths = set()
-        for values in self._data.values():
-            if hasattr(values, 'shape'):
-                lengths.add(values.shape[0])
+                    # JAX not available, keep as regular list
+                    self._data[column_name] = values.copy()
+                    self._column_types[column_name] = 'list'
+                    lengths.append(len(values))
+            elif isinstance(values, np.ndarray):
+                # Keep as numpy array
+                self._data[column_name] = values.copy()
+                self._column_types[column_name] = 'array'
+                lengths.append(len(values))
             else:
-                lengths.add(len(values))
+                # Check if it's a JAX array
+                try:
+                    import jax.numpy as jnp
+                    import jax
+                    # Check if it's a JAX array or tracer by checking for JAX-specific attributes
+                    if hasattr(values, 'shape') and hasattr(values, 'dtype'):
+                        # Check if it's actually a JAX array/tracer
+                        if (hasattr(values, 'device') or 
+                            str(type(values)).startswith('<class \'jaxlib.') or
+                            isinstance(values, (jax.Array, jax.core.Tracer)) or
+                            str(type(values).__module__).startswith('jax')):
+                            # This is a JAX array or tracer - preserve it as-is
+                            self._data[column_name] = values
+                            self._column_types[column_name] = 'jax_array'
+                            # For tracers, we need to use shape[0] instead of len()
+                            if hasattr(values, 'shape') and values.shape:
+                                lengths.append(values.shape[0])
+                            else:
+                                # Fallback for edge cases
+                                lengths.append(1)
+                        else:
+                            # This is some other array-like object, convert to numpy
+                            # Use np.asarray to avoid copy warnings in numpy 2.0+
+                            self._data[column_name] = np.asarray(values)
+                            self._column_types[column_name] = 'array'
+                            lengths.append(len(values))
+                    else:
+                        # Convert other iterables to list
+                        converted_list = list(values)
+                        self._data[column_name] = converted_list
+                        self._column_types[column_name] = 'list'
+                        lengths.append(len(converted_list))
+                except ImportError:
+                    # JAX not available, fall back to list conversion
+                    converted_list = list(values)
+                    self._data[column_name] = converted_list
+                    self._column_types[column_name] = 'list'
+                    lengths.append(len(converted_list))
         
-        if len(lengths) > 1:
-            raise ValueError(f"All arrays and lists must have the same length. Got lengths: {list(lengths)}")
-    
-    # Fast constructors for common cases
-    @classmethod
-    def from_jax_arrays(cls, data: Dict[str, Any], name: str = None) -> 'DataFrame':
-        """Ultra-fast constructor for pure JAX data."""
-        column_types = {k: ColumnType.JAX_ARRAY for k in data.keys()}
-        return cls(data, name=name, column_types=column_types, skip_validation=True)
-    
-    @classmethod
-    def from_numpy_arrays(cls, data: Dict[str, np.ndarray], name: str = None) -> 'DataFrame':
-        """Fast constructor for pure NumPy data."""
-        column_types = {k: ColumnType.NUMPY_ARRAY for k in data.keys()}
-        return cls(data, name=name, column_types=column_types, skip_validation=True)
-    
-    @classmethod
-    def from_lists(cls, data: Dict[str, List], name: str = None) -> 'DataFrame':
-        """Fast constructor for list data."""
-        column_types = {k: ColumnType.LIST for k in data.keys()}
-        return cls(data, name=name, column_types=column_types, skip_validation=True)
+        # Check that all arrays/lists have the same length
+        if len(set(lengths)) > 1:
+            raise ValueError(f"All arrays and lists must have the same length. Got lengths: {lengths}")
+        
+        self._length = lengths[0] if lengths else 0
+        self._columns = tuple(self._data.keys())  # Immutable tuple of column names
+        self._name = name  # Store the name attribute
     
     @property
     def name(self) -> str:
@@ -205,23 +145,6 @@ class DataFrame:
     def column_types(self) -> Dict[str, str]:
         """Get the data types of columns ('list' or 'array')."""
         return self._column_types.copy()
-    
-    # JIT-friendly operations
-    def to_jax_dict(self) -> Dict[str, Any]:
-        """Extract only JAX arrays for JIT functions - zero copy."""
-        return {k: v for k, v in self._data.items() 
-                if self._column_types[k] == ColumnType.JAX_ARRAY.value}
-    
-    def to_numpy_dict(self) -> Dict[str, np.ndarray]:
-        """Extract only NumPy arrays - returns views when possible."""
-        return {k: v.view() if hasattr(v, 'view') else v 
-                for k, v in self._data.items()
-                if self._column_types[k] == ColumnType.NUMPY_ARRAY.value}
-    
-    def get_jax_columns(self, columns: List[str]) -> Dict[str, Any]:
-        """Get specific JAX columns for JIT functions."""
-        return {col: self._data[col] for col in columns 
-                if col in self._data and self._column_types[col] == ColumnType.JAX_ARRAY.value}
     
     def dtypes(self) -> Dict[str, str]:
         """Get detailed data types for each column."""
@@ -258,13 +181,14 @@ class DataFrame:
     
     def __getitem__(self, key: str) -> Union[List[Any], np.ndarray, Any]:
         """
-        Get a column by name with optimized copying strategy.
+        Get a column by name.
         
         Args:
             key: Column name
             
         Returns:
-            Column data with minimal copying (views for arrays, copies for lists)
+            A copy of the column data as a list (if originally a list), 
+            numpy array (if originally a numpy array), or JAX array (if originally a JAX array)
             
         Raises:
             KeyError: If column doesn't exist
@@ -272,19 +196,15 @@ class DataFrame:
         if key not in self._data:
             raise KeyError(f"Column '{key}' not found. Available columns: {list(self._columns)}")
         
-        # Optimized access with minimal copying
-        col_type = self._column_types[key]
-        value = self._data[key]
-        
-        if col_type == ColumnType.JAX_ARRAY.value:
-            # JAX arrays are immutable - return directly
-            return value
-        elif col_type == ColumnType.NUMPY_ARRAY.value:  # 'array'
-            # Return copy for numpy arrays to maintain immutability semantics
-            return value.copy() if hasattr(value, 'copy') else value
-        else:  # LIST
-            # Copy lists for safety
-            return value.copy() if isinstance(value, list) else list(value)
+        # Return a copy to maintain immutability, preserving original type
+        if self._column_types[key] == 'list':
+            return self._data[key].copy()
+        elif self._column_types[key] == 'jax_array':
+            # For JAX arrays, we need to be careful about copying
+            # JAX arrays are immutable, so we can return them directly
+            return self._data[key]
+        else:  # numpy array
+            return self._data[key].copy()
     
     def __contains__(self, key: str) -> bool:
         """Check if a column exists in the DataFrame."""
@@ -450,35 +370,22 @@ class DataFrame:
         
         return True
     
-    def to_dict(self, copy: bool = True) -> Dict[str, Union[List[Any], np.ndarray, Any]]:
+    def to_dict(self) -> Dict[str, Union[List[Any], np.ndarray, Any]]:
         """
-        Convert DataFrame to dictionary with optimized copying.
-        
-        Args:
-            copy: Whether to copy mutable data (default True for safety)
+        Convert DataFrame to dictionary of arrays and lists.
         
         Returns:
-            Dictionary with data, minimal copying when copy=False
+            Dictionary with copies of the internal data, preserving original types
         """
-        if not copy:
-            # Return references directly - fastest but potentially unsafe
-            return dict(self._data)
-        
-        # Optimized copying based on mutability
         result = {}
         for col in self._columns:
-            col_type = self._column_types[col]
-            value = self._data[col]
-            
-            if col_type == ColumnType.JAX_ARRAY.value:
-                # JAX arrays are immutable - no copy needed
-                result[col] = value
-            elif col_type == ColumnType.NUMPY_ARRAY.value:
-                # Copy numpy arrays for safety
-                result[col] = value.copy() if hasattr(value, 'copy') else value
-            else:  # LIST
-                # Copy lists for safety
-                result[col] = value.copy() if isinstance(value, list) else list(value)
+            if self._column_types[col] == 'list':
+                result[col] = self._data[col].copy()
+            elif self._column_types[col] == 'jax_array':
+                # JAX arrays are immutable, so we can return them directly
+                result[col] = self._data[col]
+            else:  # numpy array
+                result[col] = self._data[col].copy()
         return result
     
     def get_row(self, index: int) -> Dict[str, Any]:
@@ -830,15 +737,14 @@ class DataFrame:
         new_name = f"{self._name}_joined" if self._name else None
         return DataFrame(new_data, name=new_name)
     
-    def add_column(self, column_name: str, values: Union[List, np.ndarray, Any], 
-                   column_type: Optional[Union[str, ColumnType]] = None) -> 'DataFrame':
+    def add_column(self, column_name: str, values: Union[List, np.ndarray, Any]) -> 'DataFrame':
         """
-        Add a new column to the DataFrame with optimized copying.
+        Add a new column to the DataFrame, returning a new DataFrame.
         
         Args:
             column_name: Name of the new column
-            values: Values for the new column
-            column_type: Optional pre-computed column type for speed
+            values: Values for the new column (list, numpy array, or JAX array)
+                   Must have the same length as existing columns
                    
         Returns:
             New DataFrame with the added column
@@ -849,36 +755,26 @@ class DataFrame:
         if column_name in self._columns:
             raise ValueError(f"Column '{column_name}' already exists")
         
-        # Check length compatibility (optimized)
-        if hasattr(values, 'shape'):
-            value_length = values.shape[0]
-        elif hasattr(values, '__len__'):
-            value_length = len(values)
-        else:
-            value_length = 1
-            
-        if value_length != self._length:
-            raise ValueError(f"New column must have length {self._length}, got {value_length}")
+        # Check length compatibility
+        if hasattr(values, '__len__') and len(values) != self._length:
+            raise ValueError(f"New column must have length {self._length}, got {len(values)}")
         
-        # Shallow copy existing data dict (references to immutable data)
-        new_data = dict(self._data)
+        # Create new data dictionary
+        new_data = {}
+        
+        # Copy existing columns
+        for col in self._columns:
+            if self._column_types[col] == 'list':
+                new_data[col] = self._data[col].copy()
+            elif self._column_types[col] == 'jax_array':
+                new_data[col] = self._data[col]
+            else:  # numpy array
+                new_data[col] = self._data[col].copy()
+        
+        # Add the new column
         new_data[column_name] = values
         
-        # Determine new column type efficiently
-        if column_type is not None:
-            new_column_types = dict(self._column_types)
-            if isinstance(column_type, ColumnType):
-                new_column_types[column_name] = column_type.value
-            else:
-                new_column_types[column_name] = column_type
-        else:
-            # Fast type detection for single value
-            detected_type, _ = self._detect_type_optimized(values)
-            new_column_types = dict(self._column_types)
-            new_column_types[column_name] = detected_type
-        
-        # Create new DataFrame with minimal validation
-        return DataFrame(new_data, name=self._name, column_types=new_column_types, skip_validation=True)
+        return DataFrame(new_data, name=self._name)
     
     def remove_column(self, column_name: str) -> 'DataFrame':
         """

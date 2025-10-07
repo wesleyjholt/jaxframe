@@ -23,7 +23,7 @@ class MaskedArray:
     where some observations may be missing or invalid.
     """
     
-    def __init__(self, data: Any, mask: np.ndarray, index_df: DataFrame):
+    def __init__(self, data: Any, mask: np.ndarray, index_df: DataFrame, validate: bool = True):
         """
         Initialize a MaskedArray.
         
@@ -31,36 +31,88 @@ class MaskedArray:
             data: JAX array containing the data values
             mask: Numpy boolean array with same shape as data (True = valid, False = masked)
             index_df: DataFrame containing index mappings and key values
+            validate: Whether to validate inputs (default: True)
             
         Raises:
             ValueError: If data and mask shapes don't match, or if data rows don't match index_df length
+        """
+        if validate:
+            try:
+                import jax.numpy as jnp
+            except ImportError:
+                raise ImportError("JAX is required for MaskedArray. Install with: pip install jax")
+            
+            # Validate inputs
+            if not hasattr(data, 'shape'):
+                raise ValueError("Data must be a JAX array with a shape attribute")
+            
+            if not isinstance(mask, np.ndarray):
+                raise ValueError("Mask must be a numpy array")
+            
+            if data.shape != mask.shape:
+                raise ValueError(f"Data and mask must have the same shape. "
+                               f"Got data: {data.shape}, mask: {mask.shape}")
+            
+            if not isinstance(index_df, DataFrame):
+                raise ValueError("index_df must be a DataFrame")
+            
+            if data.shape[0] != len(index_df):
+                raise ValueError(f"Number of data rows ({data.shape[0]}) "
+                               f"must match index DataFrame length ({len(index_df)})")
+        
+        self._data = data
+        self._mask = mask
+        self._index_df = index_df
+    
+    @classmethod
+    def from_validated_components(cls, data: Any, mask: np.ndarray, index_df: DataFrame) -> 'MaskedArray':
+        """
+        Create a MaskedArray from pre-validated components (faster constructor).
+        
+        Args:
+            data: JAX array (pre-validated)
+            mask: Numpy boolean array (pre-validated)
+            index_df: DataFrame (pre-validated)
+            
+        Returns:
+            New MaskedArray without validation overhead
+            
+        Note:
+            This is a performance optimization for cases where components are known to be valid.
+            Use regular constructor for safety if unsure about input validity.
+        """
+        return cls(data, mask, index_df, validate=False)
+    
+    @classmethod
+    def create_zeros_masked(cls, shape: tuple, index_df: DataFrame, fill_value: float = 0.0, 
+                           mask_value: bool = True) -> 'MaskedArray':
+        """
+        Create a MaskedArray filled with zeros and uniform mask values.
+        
+        Args:
+            shape: Shape of the data/mask arrays
+            index_df: DataFrame for index mapping
+            fill_value: Value to fill the data array with (default: 0.0)
+            mask_value: Value to fill the mask array with (default: True for valid)
+            
+        Returns:
+            New MaskedArray with zeros data and uniform mask
+            
+        Raises:
+            ValueError: If shape[0] doesn't match index_df length
         """
         try:
             import jax.numpy as jnp
         except ImportError:
             raise ImportError("JAX is required for MaskedArray. Install with: pip install jax")
+            
+        if shape[0] != len(index_df):
+            raise ValueError(f"Shape[0] ({shape[0]}) must match index_df length ({len(index_df)})")
         
-        # Validate inputs
-        if not hasattr(data, 'shape'):
-            raise ValueError("Data must be a JAX array with a shape attribute")
+        data = jnp.full(shape, fill_value, dtype=jnp.float32)
+        mask = np.full(shape, mask_value, dtype=bool)
         
-        if not isinstance(mask, np.ndarray):
-            raise ValueError("Mask must be a numpy array")
-        
-        if data.shape != mask.shape:
-            raise ValueError(f"Data and mask must have the same shape. "
-                           f"Got data: {data.shape}, mask: {mask.shape}")
-        
-        if not isinstance(index_df, DataFrame):
-            raise ValueError("index_df must be a DataFrame")
-        
-        if data.shape[0] != len(index_df):
-            raise ValueError(f"Number of data rows ({data.shape[0]}) "
-                           f"must match index DataFrame length ({len(index_df)})")
-        
-        self._data = data
-        self._mask = mask
-        self._index_df = index_df
+        return cls.from_validated_components(data, mask, index_df)
     
     @property
     def data(self) -> Any:
@@ -117,18 +169,33 @@ class MaskedArray:
             # Fallback comparison without JAX
             return False
     
-    def copy(self) -> 'MaskedArray':
-        """Create a copy of the MaskedArray."""
-        try:
-            import jax.numpy as jnp
-            # JAX arrays are immutable, but create a copy for consistency
-            data_copy = jnp.array(self._data)
-        except ImportError:
+    def copy(self, deep: bool = True) -> 'MaskedArray':
+        """
+        Create a copy of the MaskedArray.
+        
+        Args:
+            deep: Whether to deep copy arrays (default: True).
+                 For backward compatibility, creates explicit JAX array copy when deep=True.
+                 
+        Returns:
+            New MaskedArray copy
+        """
+        # Create explicit copy of JAX array for backward compatibility
+        if deep:
+            try:
+                import jax.numpy as jnp
+                data_copy = jnp.array(self._data)
+            except ImportError:
+                data_copy = self._data
+        else:
             data_copy = self._data
+        
+        # Copy mask array if requested
+        mask_copy = self._mask.copy() if deep else self._mask
             
-        return MaskedArray(
+        return MaskedArray.from_validated_components(
             data=data_copy,
-            mask=self._mask.copy(),
+            mask=mask_copy,
             index_df=self._index_df  # DataFrames are immutable in jaxframe
         )
     
@@ -176,7 +243,7 @@ class MaskedArray:
             if new_data.shape != self._mask.shape:
                 raise ValueError(f"New data shape {new_data.shape} must match mask shape {self._mask.shape}")
         
-        return MaskedArray(
+        return MaskedArray.from_validated_components(
             data=new_data,
             mask=self._mask.copy(),  # Copy the mask to ensure independence
             index_df=self._index_df  # DataFrames are immutable in jaxframe
@@ -203,15 +270,9 @@ class MaskedArray:
             if new_mask.shape != self._data.shape:
                 raise ValueError(f"New mask shape {new_mask.shape} must match data shape {self._data.shape}")
         
-        try:
-            import jax.numpy as jnp
-            # JAX arrays are immutable, but create a copy for consistency
-            data_copy = jnp.array(self._data)
-        except ImportError:
-            data_copy = self._data
-        
-        return MaskedArray(
-            data=data_copy,
+        # JAX arrays are immutable, so no need to copy
+        return MaskedArray.from_validated_components(
+            data=self._data,
             mask=new_mask,
             index_df=self._index_df  # DataFrames are immutable in jaxframe
         )
@@ -248,7 +309,7 @@ class MaskedArray:
             if new_data.shape != new_mask.shape:
                 raise ValueError(f"New data shape {new_data.shape} must match new mask shape {new_mask.shape}")
         
-        return MaskedArray(
+        return MaskedArray.from_validated_components(
             data=new_data,
             mask=new_mask,
             index_df=self._index_df  # DataFrames are immutable in jaxframe
@@ -277,15 +338,9 @@ class MaskedArray:
             if len(new_index_df) != self._data.shape[0]:
                 raise ValueError(f"New index DataFrame length ({len(new_index_df)}) must match data rows ({self._data.shape[0]})")
         
-        try:
-            import jax.numpy as jnp
-            # JAX arrays are immutable, but create a copy for consistency
-            data_copy = jnp.array(self._data)
-        except ImportError:
-            data_copy = self._data
-        
-        return MaskedArray(
-            data=data_copy,
+        # JAX arrays are immutable, so no need to copy
+        return MaskedArray.from_validated_components(
+            data=self._data,
             mask=self._mask.copy(),
             index_df=new_index_df
         )
@@ -334,15 +389,12 @@ class MaskedArray:
                 raise ValueError(f"Data shape {final_data.shape} must match mask shape {final_mask.shape}")
         
         # Create copies to ensure independence if needed
-        try:
-            import jax.numpy as jnp
-            final_data_copy = jnp.array(final_data) if new_data is not None else final_data
-        except ImportError:
-            final_data_copy = final_data
+        # JAX arrays are immutable, so no need to copy
+        final_data_copy = final_data
         
         final_mask_copy = final_mask.copy() if new_mask is not None else final_mask
         
-        return MaskedArray(
+        return MaskedArray.from_validated_components(
             data=final_data_copy,
             mask=final_mask_copy,
             index_df=final_index_df

@@ -5,11 +5,47 @@ This module provides functions for reshaping and transforming DataFrames,
 including wide-to-long format conversions with mask support.
 """
 
-from typing import List, Tuple, Any, Union, Optional
+from typing import List, Tuple, Any, Union, Optional, Dict
 import re
 import numpy as np
 from .dataframe import DataFrame
 from .masked_array import MaskedArray
+
+
+def _create_optimized_dataframe(data: Dict[str, Any]) -> DataFrame:
+    """
+    Create a DataFrame using the fastest available constructor based on data types.
+    
+    Args:
+        data: Dictionary of column name -> column data
+        
+    Returns:
+        DataFrame created with optimized constructor
+    """
+    if not data:
+        raise ValueError("Data dictionary cannot be empty")
+    
+    # Quick type detection for optimization
+    first_val = next(iter(data.values()))
+    
+    try:
+        import jax.numpy as jnp
+        # Check if all values are JAX arrays
+        if all(hasattr(val, '__class__') and hasattr(val, 'shape') and 
+               hasattr(val, 'dtype') and str(type(val).__module__).startswith('jax') 
+               for val in data.values()):
+            return DataFrame.from_jax_arrays(data)
+    except ImportError:
+        pass
+    
+    # Check if all values are NumPy arrays
+    if all(hasattr(val, 'dtype') and hasattr(val, 'shape') and 
+           str(type(val).__module__) == 'numpy' 
+           for val in data.values()):
+        return DataFrame.from_numpy_arrays(data)
+    
+    # Fall back to regular constructor for mixed types
+    return DataFrame(data)
 
 
 def wide_to_long_masked(
@@ -17,7 +53,7 @@ def wide_to_long_masked(
     id_columns: Union[str, List[str]], 
     var_pattern: str = r'([^$]+)\$(\d+)\$(value|mask)',
     var_name: Union[str, List[str]] = 'variable',
-    value_name: Union[str, List[str], None] = None
+    value_name: Union[str, List[str], None] = 'value'
 ) -> DataFrame:
     """
     Convert wide format DataFrame(s) to long format, applying masks to filter out invalid values.
@@ -75,8 +111,9 @@ def wide_to_long_masked(
         raise ValueError(f"When df is a list of DataFrames, value_name must be a list or None, "
                         f"got {type(value_name).__name__}")
     
-    # Extract default value names from DataFrames if value_name is None
-    if value_name is None:
+    # Extract default value names from DataFrames if value_name is 'value' (default)
+    if value_name == 'value' and isinstance(df, list):
+        # For multi-DataFrame case, extract meaningful names
         value_name = []
         for i, df_single in enumerate(df_list):
             # Extract variable name from the first value column found
@@ -90,6 +127,23 @@ def wide_to_long_masked(
             else:
                 # If no matching pattern found, use generic name
                 value_name.append(f"value_{i}")
+    elif value_name is None:
+        # If explicitly set to None, extract meaningful names
+        if isinstance(df, list):
+            value_name = []
+            for i, df_single in enumerate(df_list):
+                pattern = re.compile(var_pattern)
+                for col in df_single.columns:
+                    match = pattern.match(str(col))
+                    if match and match.group(3) == 'value':
+                        var_base_name = match.group(1)
+                        value_name.append(f"{var_base_name}_value")
+                        break
+                else:
+                    value_name.append(f"value_{i}")
+        else:
+            # Single DataFrame with None -> extract meaningful name
+            value_name = None  # Let _single_wide_to_long_masked handle it
     
     # Validate inputs
     if isinstance(var_name, str):
@@ -204,7 +258,7 @@ def _single_wide_to_long_masked(
                 long_data[var_name].append(time_index)
                 long_data[value_name].append(df[value_col][row_idx])
     
-    return DataFrame(long_data)
+    return _create_optimized_dataframe(long_data)
 
 
 def long_to_wide_masked(
@@ -442,7 +496,7 @@ def _single_long_to_wide_masked(
                 wide_data[value_col_name].append(fill_values[id_tuple])
                 wide_data[mask_col_name].append(mask_value)
     
-    return DataFrame(wide_data)
+    return _create_optimized_dataframe(wide_data)
 
 
 def _reorder_dataframe_by_ids(df: DataFrame, id_columns: Union[str, List[str]], reference_ordering: List) -> DataFrame:
@@ -481,7 +535,21 @@ def _reorder_dataframe_by_ids(df: DataFrame, id_columns: Union[str, List[str]], 
             # This shouldn't happen if the DataFrames are consistent
             raise ValueError(f"ID {id_key} not found in DataFrame being reordered")
     
-    return DataFrame(reordered_data)
+    # Use optimized constructor with type information preserved from original DataFrame
+    try:
+        # Get column types from original DataFrame to use appropriate constructor
+        if hasattr(df, '_column_types'):
+            # If original DataFrame has type information, try to match constructor
+            column_types = df._column_types
+            if all(col_type == 'jax_array' for col_type in column_types.values()):
+                return DataFrame.from_jax_arrays(reordered_data) 
+            elif all(col_type == 'numpy_array' for col_type in column_types.values()):
+                return DataFrame.from_numpy_arrays(reordered_data)
+    except Exception:
+        # Fall back to regular constructor if optimization fails
+        pass
+        
+    return _create_optimized_dataframe(reordered_data)
 
 
 def wide_df_to_masked_array(
@@ -570,9 +638,26 @@ def wide_df_to_masked_array(
                 col_masks = col_masks.copy()
             masks[:, i] = np.array(col_masks)  # Use numpy assignment for masks
     
-    # Create ID DataFrame
+    # Create ID DataFrame - use optimized constructor since we're copying from existing DataFrame
     id_data = {col: df[col] for col in id_columns}
-    id_df = DataFrame(id_data)
+    
+    # Detect if all ID columns are the same type for fast constructor
+    first_col = id_data[next(iter(id_data))]
+    try:
+        import jax.numpy as jnp
+        if all(hasattr(val, '__class__') and hasattr(val, 'shape') and 
+               hasattr(val, 'dtype') and str(type(val).__module__).startswith('jax') 
+               for val in id_data.values()):
+            id_df = DataFrame.from_jax_arrays(id_data)
+        elif all(hasattr(val, 'dtype') and hasattr(val, 'shape') and 
+                 str(type(val).__module__) == 'numpy' 
+                 for val in id_data.values()):
+            id_df = DataFrame.from_numpy_arrays(id_data)
+        else:
+            id_df = DataFrame(id_data)
+    except ImportError:
+        # JAX not available, use regular constructor
+        id_df = DataFrame(id_data)
     
     return MaskedArray(data=values, mask=masks, index_df=id_df)
 
@@ -627,7 +712,23 @@ def masked_array_to_wide_df(
         wide_data[value_col_name] = values_col
         wide_data[mask_col_name] = masks_col
     
-    return DataFrame(wide_data)
+    # Create DataFrame - since we have mixed data types, use regular constructor
+    # but add columns incrementally with type hints for better performance
+    result_df = DataFrame({col: id_dataframe[col] for col in id_dataframe.columns})
+    
+    # Add JAX value columns with type hints
+    for var_idx in range(n_vars):
+        value_col_name = f"{var_prefix}${var_idx}$value"
+        mask_col_name = f"{var_prefix}${var_idx}$mask"
+        
+        values_col = values_array[:, var_idx]
+        masks_col = mask_array[:, var_idx]
+        
+        # Use type hints for optimized column addition
+        result_df = result_df.add_column(value_col_name, values_col, column_type='jax_array')
+        result_df = result_df.add_column(mask_col_name, masks_col, column_type='array')
+    
+    return result_df
 
 
 def roundtrip_wide_jax_conversion(
