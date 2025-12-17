@@ -2,7 +2,7 @@
 A simple immutable DataFrame implementation using a dictionary of arrays and lists.
 Optimized for JAX compatibility with fast constructors and minimal copying.
 """
-from typing import Dict, Any, Union, List, Tuple, Optional, Literal
+from typing import Dict, Any, Union, List, Tuple, Optional, Literal, Callable
 import numpy as np
 import os
 from enum import Enum
@@ -12,6 +12,442 @@ class ColumnType(Enum):
     JAX_ARRAY = 'jax_array'
     NUMPY_ARRAY = 'array'
     LIST = 'list'
+
+
+class GroupBy:
+    """
+    GroupBy object for performing aggregations on grouped data.
+    
+    This is designed to be JAX-compatible (jittable and differentiable).
+    Uses jax.ops.segment_* operations for efficient aggregations.
+    """
+    
+    def __init__(self, df: 'DataFrame', by: Union[str, List[str]]):
+        """
+        Initialize a GroupBy object.
+        
+        Args:
+            df: The DataFrame to group
+            by: Column name(s) to group by
+        """
+        self._df = df
+        self._by = [by] if isinstance(by, str) else list(by)
+        
+        # Validate that all group columns exist
+        for col in self._by:
+            if col not in df._columns:
+                raise KeyError(f"Group column '{col}' not found in DataFrame")
+        
+        # Lazy computation - only compute groups when needed
+        self._group_indices = None
+        self._unique_groups = None
+        self._num_groups = None
+    
+    def _compute_groups(self):
+        """Compute group indices using JAX-compatible operations."""
+        if self._group_indices is not None:
+            return  # Already computed
+        
+        import jax.numpy as jnp
+        
+        # Get the grouping column(s) data
+        if len(self._by) == 1:
+            # Single column grouping
+            group_col = self._df._data[self._by[0]]
+            
+            # Handle strings/lists specially - can't use JAX operations on them
+            if isinstance(group_col, list):
+                # Convert to numpy for finding unique values
+                group_array = np.array(group_col)
+                unique_vals, inverse_indices = np.unique(group_array, return_inverse=True)
+                
+                # Keep as list for result
+                self._unique_groups = {self._by[0]: list(unique_vals)}
+                self._group_indices = jnp.array(inverse_indices)
+                self._num_groups = len(unique_vals)
+            else:
+                # Convert to JAX array if needed
+                if isinstance(group_col, np.ndarray):
+                    group_col = jnp.array(group_col)
+                
+                # Find unique groups and their indices
+                unique_vals, inverse_indices = jnp.unique(group_col, return_inverse=True)
+                
+                self._unique_groups = {self._by[0]: unique_vals}
+                self._group_indices = inverse_indices
+                self._num_groups = len(unique_vals)
+        
+        else:
+            # Multi-column grouping using prime number encoding
+            # This ensures uniqueness for combinations of group values
+            primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71]
+            
+            if len(self._by) > len(primes):
+                raise ValueError(f"Maximum {len(primes)} grouping columns supported")
+            
+            # Create composite key using prime encoding
+            composite = jnp.ones(self._df._length)
+            
+            # Store the mapping from composite key to group values
+            col_unique_vals = []
+            col_inverse_indices = []
+            
+            for i, col_name in enumerate(self._by):
+                col_data = self._df._data[col_name]
+                
+                # Handle lists (strings) specially
+                if isinstance(col_data, list):
+                    col_array = np.array(col_data)
+                    unique_vals, col_indices = np.unique(col_array, return_inverse=True)
+                    col_indices = jnp.array(col_indices)
+                    unique_vals = list(unique_vals)
+                else:
+                    # Convert to JAX array if needed
+                    if isinstance(col_data, np.ndarray):
+                        col_data = jnp.array(col_data)
+                    
+                    # Get unique values and map to indices
+                    unique_vals, col_indices = jnp.unique(col_data, return_inverse=True)
+                
+                col_unique_vals.append(unique_vals)
+                col_inverse_indices.append(col_indices)
+                
+                # Multiply composite key by prime^index
+                composite = composite * (primes[i] ** col_indices)
+            
+            # Find unique composite keys
+            unique_composites, inverse_indices = jnp.unique(composite, return_inverse=True)
+            num_groups = len(unique_composites)
+            
+            # Now we need to reconstruct the unique group combinations
+            # For each unique composite key, find the corresponding group values
+            unique_groups_dict = {col_name: [] for col_name in self._by}
+            
+            for group_idx in range(num_groups):
+                # Find first row belonging to this group
+                mask = inverse_indices == group_idx
+                first_idx = jnp.where(mask, jnp.arange(len(inverse_indices)), len(inverse_indices)).min()
+                
+                # Get the group values for this row
+                for i, col_name in enumerate(self._by):
+                    col_group_idx = int(col_inverse_indices[i][first_idx])
+                    unique_groups_dict[col_name].append(col_unique_vals[i][col_group_idx])
+            
+            # Convert lists to arrays if they're numeric
+            for col_name in self._by:
+                vals = unique_groups_dict[col_name]
+                if not isinstance(self._df._data[col_name], list):
+                    unique_groups_dict[col_name] = jnp.array(vals)
+            
+            self._unique_groups = unique_groups_dict
+            self._group_indices = inverse_indices
+            self._num_groups = num_groups
+    
+    def agg(self, agg_dict: Dict[str, Union[Tuple[str, Callable], List[Tuple[str, Callable]]]]) -> 'DataFrame':
+        """
+        Perform aggregations on grouped data.
+        
+        Args:
+            agg_dict: Dictionary mapping column names to aggregation function(s).
+                     Functions must be tuples of (name, callable):
+                     - name: String name for the aggregation (used in result column names)
+                     - callable: JAX-compatible function that reduces a group to a scalar
+                     
+                     Examples:
+                     - ('mean', jnp.mean)
+                     - ('sum', jnp.sum)
+                     - ('p90', lambda x: jnp.percentile(x, 90))
+                     - Lists of tuples: [('mean', jnp.mean), ('std', jnp.std)]
+                     
+                     Custom functions receive the group data as a JAX array and should
+                     return a scalar value.
+                     
+        Returns:
+            New DataFrame with aggregated results
+            
+        Examples:
+            >>> # Single named function
+            >>> df.group_by('category').agg({'value': ('mean', jnp.mean)})
+            
+            >>> # Multiple named functions
+            >>> df.group_by('category').agg({
+            ...     'value': [('mean', jnp.mean), ('std', jnp.std)]
+            ... })
+            
+            >>> # Multiple columns with named functions
+            >>> df.group_by('category').agg({
+            ...     'sales': [('mean', jnp.mean), ('sum', jnp.sum)],
+            ...     'profit': [('mean', jnp.mean), ('max', jnp.max)]
+            ... })
+        """
+        import jax.numpy as jnp
+        from jax.ops import segment_sum
+        
+        # Compute groups if not already done
+        self._compute_groups()
+        
+        # Result will contain group columns + aggregated columns
+        result_data = {}
+        
+        # Add group columns
+        for col_name, unique_vals in self._unique_groups.items():
+            result_data[col_name] = unique_vals
+        
+        # Process each aggregation
+        for col_name, agg_funcs in agg_dict.items():
+            if col_name not in self._df._columns:
+                raise KeyError(f"Column '{col_name}' not found in DataFrame")
+            
+            # Normalize to list of functions
+            if isinstance(agg_funcs, tuple):
+                agg_funcs = [agg_funcs]
+            elif not isinstance(agg_funcs, list):
+                raise TypeError(
+                    f"Aggregation functions must be tuples (name, callable) or lists of tuples. "
+                    f"Got {type(agg_funcs).__name__}. "
+                    f"Example: ('mean', jnp.mean) or [('mean', jnp.mean), ('std', jnp.std)]"
+                )
+            
+            # Get column data as JAX array
+            col_data = self._df._data[col_name]
+            if isinstance(col_data, list):
+                col_data = jnp.array(col_data)
+            elif isinstance(col_data, np.ndarray):
+                col_data = jnp.array(col_data)
+            
+            # Apply each aggregation function
+            for func_idx, agg_func in enumerate(agg_funcs):
+                # Check if it's a named custom function (tuple)
+                if isinstance(agg_func, tuple):
+                    if len(agg_func) != 2:
+                        raise ValueError(
+                            f"Tuple aggregation must be (name, function), got tuple of length {len(agg_func)}"
+                        )
+                    
+                    func_name, func = agg_func
+                    
+                    if not isinstance(func_name, str):
+                        raise TypeError(
+                            f"First element of tuple must be a string name, got {type(func_name).__name__}"
+                        )
+                    
+                    if not callable(func):
+                        raise TypeError(
+                            f"Second element of tuple must be a callable, got {type(func).__name__}"
+                        )
+                    
+                    # Apply custom aggregation function
+                    result_col = self._apply_custom_agg(func, col_data, col_name)
+                    result_name = f"{col_name}_{func_name}"
+                
+                else:
+                    raise TypeError(
+                        f"Aggregation function must be a tuple (name, callable), "
+                        f"got {type(agg_func).__name__}. "
+                        f"Bare callables are not allowed. Use tuples like ('mean', jnp.mean) instead."
+                    )
+                
+                result_data[result_name] = result_col
+        
+        # Import DataFrame here to avoid circular import issues
+        return DataFrame(result_data)
+    
+    def _apply_custom_agg(self, func: Callable, col_data: Any, col_name: str) -> Any:
+        """
+        Apply a custom aggregation function to each group.
+        
+        Args:
+            func: Callable that takes a group array and returns a scalar
+            col_data: Column data as JAX array
+            col_name: Column name (for error messages)
+            
+        Returns:
+            Array of aggregated values (one per group)
+        """
+        import jax.numpy as jnp
+        from jax import core
+
+        # When we're being traced (e.g. inside jit), only a subset of reductions are supported.
+        is_traced = isinstance(col_data, core.Tracer)
+
+        if is_traced:
+            return self._apply_traced_agg(func, col_data, col_name)
+
+        # Non-traced path: we can safely use boolean indexing for exact results
+        result = []
+        for group_idx in range(self._num_groups):
+            mask = jnp.asarray(self._group_indices == group_idx)
+            group_data = col_data[mask]
+
+            try:
+                agg_value = func(group_data)
+                if hasattr(agg_value, 'shape') and agg_value.shape != ():
+                    raise ValueError(
+                        f"Custom aggregation function must return a scalar, "
+                        f"got shape {agg_value.shape}"
+                    )
+                result.append(agg_value)
+            except Exception as e:
+                raise ValueError(
+                    f"Error applying custom aggregation to column '{col_name}' "
+                    f"for group {group_idx}: {str(e)}"
+                )
+
+        return jnp.array(result)
+
+    def _apply_traced_agg(self, func: Callable, col_data: Any, col_name: str):
+        """Apply aggregation while under JAX tracing (e.g. inside jit)."""
+        import jax.numpy as jnp
+        from jax.ops import segment_sum
+
+        func_name = getattr(func, '__name__', None)
+
+        if func_name == 'mean':
+            sums = segment_sum(col_data, self._group_indices, self._num_groups)
+            counts = segment_sum(
+                jnp.ones(self._df._length, dtype=col_data.dtype),
+                self._group_indices,
+                self._num_groups,
+            )
+            return sums / counts
+
+        if func_name == 'sum':
+            return segment_sum(col_data, self._group_indices, self._num_groups)
+
+        if func_name == 'min':
+            return self._segment_min(col_data, self._group_indices, self._num_groups)
+
+        if func_name == 'max':
+            return self._segment_max(col_data, self._group_indices, self._num_groups)
+
+        raise TypeError(
+            "Aggregation function is not supported under JIT/tracing. "
+            "Supported callables are jnp.mean, jnp.sum, jnp.min, and jnp.max. "
+            f"Got function '{func_name or type(func).__name__}' for column '{col_name}'."
+        )
+    
+    def _segment_min(self, data, segment_ids, num_segments):
+        """Compute minimum per segment using JAX operations."""
+        import jax.numpy as jnp
+        from jax.ops import segment_sum
+        
+        # Initialize with large values
+        result = jnp.full(num_segments, jnp.inf)
+        
+        # For each unique segment, find minimum
+        for i in range(num_segments):
+            mask = segment_ids == i
+            if jnp.any(mask):
+                result = result.at[i].set(jnp.min(jnp.where(mask, data, jnp.inf)))
+        
+        return result
+    
+    def _segment_max(self, data, segment_ids, num_segments):
+        """Compute maximum per segment using JAX operations."""
+        import jax.numpy as jnp
+        from jax.ops import segment_sum
+        
+        # Initialize with small values
+        result = jnp.full(num_segments, -jnp.inf)
+        
+        # For each unique segment, find maximum
+        for i in range(num_segments):
+            mask = segment_ids == i
+            if jnp.any(mask):
+                result = result.at[i].set(jnp.max(jnp.where(mask, data, -jnp.inf)))
+        
+        return result
+    
+    def apply(self, func: Callable, column: str, output_column: Optional[str] = None) -> 'DataFrame':
+        """
+        Apply a function to each group separately.
+        
+        This applies a JAX-compatible function to a column within each group,
+        returning a DataFrame with the original row count but with the function
+        applied per-group. This is different from agg() which reduces each group
+        to a single value.
+        
+        Args:
+            func: A callable that takes an array and returns a transformed array
+                  of the same length. Should be JAX-compatible.
+            column: Column name to apply the function to
+            output_column: Optional name for output column. If not specified,
+                          replaces the input column.
+        
+        Returns:
+            New DataFrame with function applied per group (original row count preserved)
+            
+        Examples:
+            >>> # Normalize values within each group
+            >>> df.group_by('category').apply(
+            ...     lambda x: (x - x.mean()) / x.std(),
+            ...     'values',
+            ...     output_column='normalized_values'
+            ... )
+            
+            >>> # Rank within groups
+            >>> df.group_by('department').apply(
+            ...     lambda x: jnp.argsort(jnp.argsort(x)),
+            ...     'salary',
+            ...     output_column='salary_rank'
+            ... )
+        
+        Note:
+            - Function must accept and return array of same length
+            - Each group is processed independently
+            - Original DataFrame row order is preserved
+            - All rows from original DataFrame are returned
+        """
+        import jax.numpy as jnp
+        
+        # Compute groups if not already done
+        self._compute_groups()
+        
+        # Validate column exists
+        if column not in self._df._columns:
+            raise KeyError(f"Column '{column}' not found in DataFrame")
+        
+        # Determine output column name
+        if output_column is None:
+            output_column = column
+        
+        # Get column data
+        col_data = self._df._data[column]
+        if isinstance(col_data, list):
+            col_data = jnp.array(col_data)
+        elif isinstance(col_data, np.ndarray):
+            col_data = jnp.array(col_data)
+        
+        # Create result array (same length as original data)
+        result = jnp.zeros_like(col_data)
+        
+        # Apply function to each group
+        for group_idx in range(self._num_groups):
+            # Get indices for this group using jnp.where for JIT compatibility
+            indices = jnp.where(self._group_indices == group_idx, size=self._df._length)[0]
+            
+            # Extract group data
+            group_data = col_data[indices]
+            
+            # Apply function
+            transformed = func(group_data)
+            
+            # Validate output length
+            if len(transformed) != len(group_data):
+                raise ValueError(
+                    f"Function must return array of same length as input. "
+                    f"Expected {len(group_data)}, got {len(transformed)}"
+                )
+            
+            # Put transformed data back in result using integer indexing
+            result = result.at[indices].set(transformed)
+        
+        # Create new DataFrame with result
+        new_data = self._df._data.copy()
+        new_data[output_column] = result
+        
+        # Import DataFrame here to avoid issues
+        return DataFrame(new_data, name=self._df._name)
 
 
 class DataFrame:
@@ -25,7 +461,8 @@ class DataFrame:
                  data: Dict[str, Union[List, np.ndarray]], 
                  name: str = None,
                  column_types: Optional[Dict[str, Union[str, ColumnType]]] = None,
-                 skip_validation: bool = False):
+                 skip_validation: bool = False,
+                 categorical: Optional[Dict[str, bool]] = None):
         """
         Initialize a DataFrame with optimized type detection and minimal copying.
         
@@ -34,6 +471,11 @@ class DataFrame:
             name: Optional name for the DataFrame
             column_types: Pre-computed column types (skips expensive detection)
             skip_validation: Skip length validation for internal operations
+            categorical: Optional dict specifying which columns are categorical.
+                        If not provided, inferred automatically based on dtype.
+                        - Float dtypes: Always non-categorical (cannot be forced)
+                        - String dtypes: Always categorical (cannot be forced)
+                        - Int/bool dtypes: Categorical by default (can be changed)
                  
         Raises:
             ValueError: If arrays/lists have different lengths or if data is empty.
@@ -64,6 +506,9 @@ class DataFrame:
         # Validate lengths only if requested
         if not skip_validation:
             self._validate_lengths()
+        
+        # Initialize categorical tracking
+        self._categorical = self._init_categorical(categorical)
     
     def _normalize_column_types(self, column_types: Dict[str, Union[str, ColumnType]]) -> Dict[str, str]:
         """Convert column types to string format."""
@@ -168,6 +613,107 @@ class DataFrame:
         if len(lengths) > 1:
             raise ValueError(f"All arrays and lists must have the same length. Got lengths: {list(lengths)}")
     
+    def _init_categorical(self, categorical: Optional[Dict[str, bool]] = None) -> Dict[str, bool]:
+        """
+        Initialize categorical tracking for each column.
+        
+        Args:
+            categorical: Optional user-specified categorical flags
+            
+        Returns:
+            Dictionary mapping column names to categorical status
+            
+        Rules:
+        - Float-like dtypes: Always non-categorical (cannot be forced)
+        - String-like dtypes: Always categorical (cannot be forced)
+        - Int-like dtypes: Categorical by default, but can be forced either way
+        - Bool dtypes: Categorical by default, but can be forced either way
+        """
+        result = {}
+        
+        for col_name in self._columns:
+            col_data = self._data[col_name]
+            
+            # Determine the base dtype category
+            dtype_category = self._get_dtype_category(col_name, col_data)
+            
+            # Check if user provided override
+            if categorical is not None and col_name in categorical:
+                user_preference = categorical[col_name]
+                
+                # Validate that override is allowed
+                if dtype_category == 'float' and user_preference:
+                    raise ValueError(
+                        f"Cannot force float-like column '{col_name}' to be categorical. "
+                        f"Float columns must be non-categorical."
+                    )
+                elif dtype_category == 'string' and not user_preference:
+                    raise ValueError(
+                        f"Cannot force string-like column '{col_name}' to be non-categorical. "
+                        f"String columns must be categorical."
+                    )
+                else:
+                    # Int/bool columns can be toggled - use user preference
+                    result[col_name] = user_preference
+            else:
+                # Use default based on dtype
+                if dtype_category == 'float':
+                    result[col_name] = False  # Float = non-categorical
+                elif dtype_category == 'string':
+                    result[col_name] = True   # String = categorical
+                elif dtype_category == 'int':
+                    result[col_name] = True   # Int = categorical by default
+                elif dtype_category == 'bool':
+                    result[col_name] = True   # Bool = categorical
+                else:
+                    result[col_name] = True   # Unknown = categorical by default
+        
+        return result
+    
+    def _get_dtype_category(self, col_name: str, col_data: Any) -> str:
+        """
+        Determine the dtype category (float, int, string, bool, other).
+        
+        Args:
+            col_name: Column name
+            col_data: Column data
+            
+        Returns:
+            One of: 'float', 'int', 'string', 'bool', 'other'
+        """
+        # Check array dtypes first
+        if hasattr(col_data, 'dtype'):
+            dtype_str = str(col_data.dtype)
+            
+            if 'float' in dtype_str or dtype_str in ['float16', 'float32', 'float64']:
+                return 'float'
+            elif 'int' in dtype_str or dtype_str in ['int8', 'int16', 'int32', 'int64', 
+                                                       'uint8', 'uint16', 'uint32', 'uint64']:
+                return 'int'
+            elif 'bool' in dtype_str:
+                return 'bool'
+            elif 'str' in dtype_str or 'object' in dtype_str or 'unicode' in dtype_str or '<U' in dtype_str:
+                return 'string'
+            else:
+                return 'other'
+        
+        # Check list dtypes by examining first element
+        elif isinstance(col_data, list) and len(col_data) > 0:
+            first_elem = col_data[0]
+            
+            if isinstance(first_elem, str):
+                return 'string'
+            elif isinstance(first_elem, bool):
+                return 'bool'
+            elif isinstance(first_elem, int) and not isinstance(first_elem, bool):
+                return 'int'
+            elif isinstance(first_elem, float):
+                return 'float'
+            else:
+                return 'other'
+        
+        return 'other'
+    
     # Fast constructors for common cases
     @classmethod
     def from_jax_arrays(cls, data: Dict[str, Any], name: str = None) -> 'DataFrame':
@@ -207,6 +753,52 @@ class DataFrame:
         """Get the data types of columns ('list' or 'array')."""
         return self._column_types.copy()
     
+    @property
+    def categorical(self) -> Dict[str, bool]:
+        """
+        Get categorical status for each column.
+        
+        Returns:
+            Dictionary mapping column names to boolean indicating if categorical
+        """
+        return self._categorical.copy()
+    
+    def is_categorical(self, column: str) -> bool:
+        """
+        Check if a specific column is categorical.
+        
+        Args:
+            column: Column name
+            
+        Returns:
+            True if column is categorical, False otherwise
+            
+        Raises:
+            KeyError: If column doesn't exist
+        """
+        if column not in self._columns:
+            raise KeyError(f"Column '{column}' not found. Available: {list(self._columns)}")
+        
+        return self._categorical[column]
+    
+    def get_categorical_columns(self) -> List[str]:
+        """
+        Get list of all categorical columns.
+        
+        Returns:
+            List of column names that are categorical
+        """
+        return [col for col in self._columns if self._categorical[col]]
+    
+    def get_non_categorical_columns(self) -> List[str]:
+        """
+        Get list of all non-categorical columns.
+        
+        Returns:
+            List of column names that are non-categorical
+        """
+        return [col for col in self._columns if not self._categorical[col]]
+    
     # JIT-friendly operations
     def to_jax_dict(self) -> Dict[str, Any]:
         """Extract only JAX arrays for JIT functions - zero copy."""
@@ -233,13 +825,13 @@ class DataFrame:
                 # For numpy arrays or JAX arrays
                 dtypes[col_name] = str(col_data.dtype)
             elif isinstance(col_data, list) and len(col_data) > 0:
-                # For lists, get the type of the first element
+                # For lists, get the type of the first element (not the container)
                 first_element = col_data[0]
                 element_type = type(first_element).__name__
-                dtypes[col_name] = f"list[{element_type}]"
+                dtypes[col_name] = element_type
             else:
-                # Fallback
-                dtypes[col_name] = type(col_data).__name__
+                # Fallback - empty list or other type
+                dtypes[col_name] = 'object'
         return dtypes
     
     @property
@@ -264,7 +856,110 @@ class DataFrame:
         Returns:
             New DataFrame with the same data but different name
         """
-        return DataFrame(self._data, name=name)
+        return DataFrame(self._data, name=name, column_types=self._column_types, 
+                        skip_validation=True, categorical=self._categorical)
+    
+    def as_categorical(self, columns: Union[str, List[str]]) -> 'DataFrame':
+        """
+        Mark columns as categorical.
+        
+        Args:
+            columns: Column name(s) to mark as categorical
+            
+        Returns:
+            New DataFrame with updated categorical flags
+            
+        Raises:
+            ValueError: If trying to mark float-like columns as categorical
+            KeyError: If column doesn't exist
+            
+        Examples:
+            >>> df.as_categorical('user_id')
+            >>> df.as_categorical(['user_id', 'product_id'])
+        """
+        if isinstance(columns, str):
+            columns = [columns]
+        
+        # Validate all columns exist
+        for col in columns:
+            if col not in self._columns:
+                raise KeyError(f"Column '{col}' not found. Available: {list(self._columns)}")
+        
+        # Create new categorical dict
+        new_categorical = self._categorical.copy()
+        
+        # Validate and update each column
+        for col in columns:
+            dtype_category = self._get_dtype_category(col, self._data[col])
+            
+            if dtype_category == 'float':
+                raise ValueError(
+                    f"Cannot mark float-like column '{col}' as categorical. "
+                    f"Float columns must be non-categorical. "
+                    f"Detected dtype: {self.dtypes[col]}"
+                )
+            
+            new_categorical[col] = True
+        
+        # Create new DataFrame with updated categorical flags
+        return DataFrame(
+            self._data,
+            name=self._name,
+            column_types=self._column_types,
+            skip_validation=True,
+            categorical=new_categorical
+        )
+    
+    def as_non_categorical(self, columns: Union[str, List[str]]) -> 'DataFrame':
+        """
+        Mark columns as non-categorical.
+        
+        Args:
+            columns: Column name(s) to mark as non-categorical
+            
+        Returns:
+            New DataFrame with updated categorical flags
+            
+        Raises:
+            ValueError: If trying to mark string-like columns as non-categorical
+            KeyError: If column doesn't exist
+            
+        Examples:
+            >>> df.as_non_categorical('age')
+            >>> df.as_non_categorical(['age', 'count'])
+        """
+        if isinstance(columns, str):
+            columns = [columns]
+        
+        # Validate all columns exist
+        for col in columns:
+            if col not in self._columns:
+                raise KeyError(f"Column '{col}' not found. Available: {list(self._columns)}")
+        
+        # Create new categorical dict
+        new_categorical = self._categorical.copy()
+        
+        # Validate and update each column
+        for col in columns:
+            dtype_category = self._get_dtype_category(col, self._data[col])
+            
+            if dtype_category == 'string':
+                raise ValueError(
+                    f"Cannot mark string-like column '{col}' as non-categorical. "
+                    f"String columns must be categorical. "
+                    f"Detected dtype: {self.dtypes[col]}"
+                )
+            
+            new_categorical[col] = False
+        
+        # Create new DataFrame with updated categorical flags
+        return DataFrame(
+            self._data,
+            name=self._name,
+            column_types=self._column_types,
+            skip_validation=True,
+            categorical=new_categorical
+        )
     
     def __getitem__(self, key: str) -> Union[List[Any], np.ndarray, Any]:
         """
@@ -1878,5 +2573,196 @@ class DataFrame:
                 new_data[col_name] = [col_data[i] for i in range(len(col_data)) if mask[i]]
             else:
                 new_data[col_name] = col_data[mask]
+        
+        return DataFrame(new_data, name=self._name)
+    
+    def group_by(self, by: Union[str, List[str]]) -> GroupBy:
+        """
+        Group the DataFrame by one or more columns.
+        
+        This is a Polars-compatible method that returns a GroupBy object.
+        The GroupBy object can be used to perform aggregations on the grouped data.
+        
+        All operations are JAX-compatible (jittable and differentiable).
+        
+        Args:
+            by: Column name(s) to group by. Can be a single string or list of strings.
+            
+        Returns:
+            GroupBy object for performing aggregations
+            
+        Examples:
+            >>> df.group_by('category').agg({'value': 'sum'})
+            >>> df.group_by(['year', 'month']).agg({'sales': ['sum', 'mean'], 'count': 'count'})
+        """
+        return GroupBy(self, by)
+    
+    def apply(self, func: Callable, columns: Union[str, List[str]], 
+              output_column: Optional[str] = None) -> 'DataFrame':
+        """
+        Apply a JAX-compatible function to one or more columns.
+        
+        This method allows you to apply custom transformations to columns while maintaining
+        JAX compatibility (jittable and differentiable). The function should work with JAX arrays.
+        
+        Args:
+            func: A callable that takes column data and returns transformed data.
+                  Should be JAX-compatible (works with jnp arrays).
+            columns: Column name(s) to apply the function to.
+                    - If str: apply to single column, replace it
+                    - If List[str]: apply to multiple columns, func receives them as separate args
+            output_column: Optional name for output column. If not specified:
+                          - Single column: replaces the input column
+                          - Multiple columns: raises error (must specify output_column)
+        
+        Returns:
+            New DataFrame with the function applied
+            
+        Examples:
+            >>> # Apply to single column (in-place replacement)
+            >>> df.apply(lambda x: x ** 2, 'values')
+            
+            >>> # Apply to single column with new name
+            >>> df.apply(lambda x: x ** 2, 'values', output_column='values_squared')
+            
+            >>> # Apply to multiple columns
+            >>> df.apply(lambda x, y: x + y, ['col1', 'col2'], output_column='sum')
+            
+            >>> # JAX-compatible function
+            >>> import jax.numpy as jnp
+            >>> df.apply(jnp.log, 'values', output_column='log_values')
+            
+        Note:
+            - The function should work with JAX arrays for full JAX compatibility
+            - For multiple columns, function receives them as separate positional arguments
+            - Output must have same length as input columns
+        """
+        import jax.numpy as jnp
+        
+        # Normalize columns to list
+        if isinstance(columns, str):
+            columns = [columns]
+            single_column = True
+        else:
+            columns = list(columns)
+            single_column = False
+        
+        # Validate columns exist
+        for col in columns:
+            if col not in self._columns:
+                raise KeyError(f"Column '{col}' not found in DataFrame")
+        
+        # Determine output column name
+        if output_column is None:
+            if single_column:
+                output_column = columns[0]  # Replace the input column
+            else:
+                raise ValueError("output_column must be specified when applying to multiple columns")
+        
+        # Get column data
+        col_data_list = []
+        for col in columns:
+            col_data = self._data[col]
+            
+            # Convert to JAX array if needed for consistency
+            if isinstance(col_data, list):
+                col_data = jnp.array(col_data)
+            elif isinstance(col_data, np.ndarray):
+                col_data = jnp.array(col_data)
+            
+            col_data_list.append(col_data)
+        
+        # Apply function
+        if len(col_data_list) == 1:
+            result = func(col_data_list[0])
+        else:
+            result = func(*col_data_list)
+        
+        # Validate result length
+        # Check if result is scalar (0-dimensional)
+        if not hasattr(result, 'shape'):
+            # Not an array-like object
+            raise ValueError(f"Function must return an array, got {type(result)}")
+        elif result.shape == () or len(result.shape) == 0:
+            # Scalar (0-dimensional array)
+            raise ValueError(f"Function returned scalar value. Output must be an array with length {self._length}")
+        elif result.shape[0] != self._length:
+            # Array with wrong length
+            raise ValueError(f"Function output length ({result.shape[0]}) must match DataFrame length ({self._length})")
+        
+        # Create new DataFrame with result
+        new_data = self._data.copy()
+        new_data[output_column] = result
+        
+        return DataFrame(new_data, name=self._name)
+
+    def rename(self, mapping: Optional[Union[Dict[str, str], List[Tuple[str, str]], Tuple[Tuple[str, str], ...]]] = None, *, function: Optional[Callable[[str], str]] = None) -> 'DataFrame':
+        """Rename columns using Polars-compatible semantics."""
+        if mapping is None:
+            rename_map: Dict[str, str] = {}
+        elif isinstance(mapping, dict):
+            rename_map = dict(mapping)
+        elif isinstance(mapping, tuple) and len(mapping) == 2 and all(isinstance(item, str) for item in mapping):
+            rename_map = {mapping[0]: mapping[1]}
+        elif isinstance(mapping, (list, tuple)):
+            try:
+                rename_map = dict(mapping)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise TypeError("mapping must be a dict or a sequence of (old, new) pairs")
+        else:
+            raise TypeError("mapping must be a dict or a sequence of (old, new) pairs")
+
+        for old_name, new_name in rename_map.items():
+            if old_name not in self._columns:
+                raise KeyError(f"Column '{old_name}' not found in DataFrame")
+            if not isinstance(new_name, str):
+                raise TypeError("New column names must be strings")
+
+        if function is not None and not callable(function):
+            raise TypeError("function must be callable")
+
+        new_columns: List[str] = []
+        for col in self._columns:
+            updated_name = rename_map.get(col, col)
+            if function is not None:
+                updated_name = function(updated_name)
+                if not isinstance(updated_name, str):
+                    raise TypeError("function must return a string")
+            new_columns.append(updated_name)
+
+        if len(set(new_columns)) != len(new_columns):
+            raise ValueError("Renaming columns produced duplicate column names")
+
+        new_data = {new_col: self._data[old_col] for old_col, new_col in zip(self._columns, new_columns)}
+        new_column_types = {new_col: self._column_types[old_col] for old_col, new_col in zip(self._columns, new_columns)}
+        new_categorical = {new_col: self._categorical[old_col] for old_col, new_col in zip(self._columns, new_columns)}
+
+        return DataFrame(new_data, name=self._name, column_types=new_column_types, skip_validation=True, categorical=new_categorical)
+    
+    def select(self, *columns: str) -> 'DataFrame':
+        """
+        Select specific columns from the DataFrame.
+        
+        This is a Polars-compatible method.
+        
+        Args:
+            *columns: Names of columns to select
+            
+        Returns:
+            New DataFrame with only the selected columns
+            
+        Examples:
+            >>> df.select('name', 'age')
+            >>> df.select(['name', 'age'])
+        """
+        # Flatten if a single list was passed
+        if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
+            columns = columns[0]
+        
+        new_data = {}
+        for col in columns:
+            if col not in self._columns:
+                raise KeyError(f"Column '{col}' not found in DataFrame")
+            new_data[col] = self._data[col]
         
         return DataFrame(new_data, name=self._name)

@@ -115,13 +115,18 @@ class TestPerformanceComparison:
         data_with_missing = np.random.randn(self.missing_size)
         mask = np.random.random(self.missing_size) > 0.2  # 80% valid (True = valid, False = masked)
         
-        # Create index DataFrame for MaskedArray
-        index_df = DataFrame({'index': list(range(self.missing_size))})
+        # Create skeleton DataFrame for MaskedArray
+        skeleton_df = DataFrame({
+            'index': list(range(self.missing_size)),
+            'var$0$value': [0.0] * self.missing_size,
+            'var$0$mask': [True] * self.missing_size
+        })
         
         self.masked_array = MaskedArray(
             data=jnp.array(data_with_missing),
             mask=np.array(mask),  # MaskedArray expects numpy mask
-            index_df=index_df
+            wide_skeleton_df=skeleton_df,
+            index_columns='index'
         )
         
         self.df_with_missing = DataFrame({

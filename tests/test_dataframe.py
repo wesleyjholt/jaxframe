@@ -217,6 +217,40 @@ def test_name_attribute():
     assert selected_df.name == "test_df_selected"
 
 
+def test_rename_with_mapping():
+    df = DataFrame({'a': [1, 2], 'b': [3, 4]})
+
+    renamed = df.rename({'a': 'alpha', 'b': 'beta'})
+
+    assert df.columns == ('a', 'b')
+    assert renamed.columns == ('alpha', 'beta')
+    assert renamed.dtypes['alpha'] == df.dtypes['a']
+    assert renamed.dtypes['beta'] == df.dtypes['b']
+    assert list(renamed['alpha']) == [1, 2]
+    assert list(renamed['beta']) == [3, 4]
+
+
+def test_rename_with_sequence_and_function():
+    df = DataFrame({'foo': [1, 2], 'bar': [3, 4], 'baz': [5, 6]})
+
+    renamed = df.rename([('foo', 'first')], function=lambda name: name.upper())
+
+    assert renamed.columns == ('FIRST', 'BAR', 'BAZ')
+    assert list(renamed['FIRST']) == [1, 2]
+    assert list(renamed['BAR']) == [3, 4]
+    assert list(renamed['BAZ']) == [5, 6]
+
+
+def test_rename_errors():
+    df = DataFrame({'a': [1], 'b': [2]})
+
+    with pytest.raises(KeyError):
+        df.rename({'missing': 'x'})
+
+    with pytest.raises(ValueError, match="duplicate column names"):
+        df.rename({'a': 'b'})
+
+
 def test_join_column():
     """Test the join method."""
     # Create first DataFrame (like sample_assay_df)
@@ -1005,9 +1039,9 @@ def test_polars_api_compatibility():
     # Test dtypes property (not method) - Polars compatibility
     dtypes_result = df.dtypes
     assert isinstance(dtypes_result, dict)
-    assert dtypes_result['strings'] == 'list[str]'
-    assert dtypes_result['integers'] == 'list[int]'
-    assert dtypes_result['floats'] == 'list[float]'
+    assert dtypes_result['strings'] == 'str'  # Element type, not container
+    assert dtypes_result['integers'] == 'int'  # Element type, not container
+    assert dtypes_result['floats'] == 'float'  # Element type, not container
     assert dtypes_result['numpy_ints'] == 'int64'
     assert dtypes_result['numpy_floats'] == 'float64'
     

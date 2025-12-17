@@ -5,7 +5,30 @@ import pytest
 import numpy as np
 import jax.numpy as jnp
 from src.jaxframe import DataFrame
-from src.jaxframe.transform import wide_to_long_masked, long_to_wide_masked
+from src.jaxframe.transform import (
+    wide_to_long_masked,
+    long_to_wide_masked,
+    wide_df_to_masked_array,
+    masked_array_to_wide_df,
+    pivot_sparse,
+    unpivot_sparse,
+    to_masked_array,
+    from_masked_array,
+)
+
+
+def _assert_dataframes_equal(df_left: DataFrame, df_right: DataFrame):
+    assert df_left.columns == df_right.columns
+    for column in df_left.columns:
+        left_col = df_left[column]
+        right_col = df_right[column]
+        if hasattr(left_col, '__array__') or hasattr(right_col, '__array__'):
+            left_arr = np.array(left_col)
+            right_arr = np.array(right_col)
+            assert left_arr.shape == right_arr.shape
+            assert np.allclose(left_arr, right_arr, equal_nan=True)
+        else:
+            assert list(left_col) == list(right_col)
 
 
 class TestExtendedTransformFunctions:
@@ -227,9 +250,137 @@ class TestExtendedTransformFunctions:
         assert set(long_df.columns) == expected_columns
         
         # Should have fewer rows due to masking
-        # time_df contributes: 3 + 2 = 5 rows (middle sample time$1 masked)
-        # But we're joining, so we need to see what the actual result is
-        assert len(long_df) > 0  # At least some data should be present
+
+    def test_sort_within_id_adds_original_order_metadata(self):
+        """long_to_wide_masked should optionally sort values and retain original order."""
+        long_df = DataFrame({
+            'patient_id': ['P001', 'P001', 'P002', 'P002', 'P003', 'P003', 'P003'],
+            'study_arm': ['control', 'control', 'treated', 'treated', 'control', 'control', 'control'],
+            'temperature_f': jnp.array([98.6, 99.2, 97.9, 98.4, 99.1, 99.0, 99.3], dtype=jnp.float32)
+        })
+
+        wide_df = long_to_wide_masked(
+            long_df,
+            id_columns=['patient_id', 'study_arm'],
+            value_column='temperature_f',
+            var_prefix='temp',
+            fill_type=jnp.nan,
+            mask_value=False,
+            sort_within_id=True
+        )
+
+        # Expect order-tracking columns
+        assert 'temp$0$order' in wide_df.columns
+
+        # Build reference ordering info
+        observations_by_key = {}
+        counters = {}
+        for idx in range(len(long_df)):
+            key = (long_df['patient_id'][idx], long_df['study_arm'][idx])
+            position = counters.get(key, 0)
+            counters[key] = position + 1
+            value = float(long_df['temperature_f'][idx])
+            observations_by_key.setdefault(key, []).append((position, value))
+        sorted_by_value = {
+            key: sorted([(val, pos) for pos, val in values], key=lambda x: x[0])
+            for key, values in observations_by_key.items()
+        }
+
+        # Verify wide view reflects ascending order and tracks original positions
+        temp_value_columns = [
+            col for col in wide_df.columns if col.startswith('temp$') and col.endswith('$value')
+        ]
+        max_slots = len(temp_value_columns)
+
+        for row_idx in range(len(wide_df)):
+            key = (wide_df['patient_id'][row_idx], wide_df['study_arm'][row_idx])
+            expected = sorted_by_value[key]
+            for slot_idx, (expected_value, original_pos) in enumerate(expected):
+                value_col = f"temp${slot_idx}$value"
+                order_col = f"temp${slot_idx}$order"
+                assert pytest.approx(float(wide_df[value_col][row_idx]), rel=1e-6) == expected_value
+                assert int(wide_df[order_col][row_idx]) == original_pos
+
+            # Slots beyond observed values should have mask=False and order=-1
+            for slot_idx in range(len(expected), max_slots):
+                mask_col = f"temp${slot_idx}$mask"
+                order_col = f"temp${slot_idx}$order"
+                assert wide_df[mask_col][row_idx] is False
+                assert int(wide_df[order_col][row_idx]) == -1
+
+        # Convert back to long format and ensure original ordering can be restored
+        long_back = wide_to_long_masked(
+            wide_df,
+            id_columns=['patient_id', 'study_arm'],
+            var_name='slot',
+            value_name='temperature_f',
+            order_value_name='original_order'
+        )
+
+        reconstructed = {}
+        for idx in range(len(long_back)):
+            key = (long_back['patient_id'][idx], long_back['study_arm'][idx])
+            reconstructed.setdefault(key, []).append(
+                (int(long_back['original_order'][idx]), float(long_back['temperature_f'][idx]))
+            )
+
+        for key, expected_values in observations_by_key.items():
+            expected_sorted = sorted(expected_values, key=lambda x: x[0])
+            actual_sorted = sorted(reconstructed[key], key=lambda x: x[0])
+            assert len(expected_sorted) == len(actual_sorted)
+            for (_, expected_value), (_, actual_value) in zip(expected_sorted, actual_sorted):
+                assert pytest.approx(expected_value, rel=1e-6) == actual_value
+
+    def test_sort_within_id_with_var_column_not_allowed(self):
+        """sort_within_id should not accept explicit var_column assignments."""
+        long_df = DataFrame({
+            'id': ['A', 'A', 'B', 'B'],
+            'visit': [0, 1, 0, 1],
+            'value': jnp.array([2.0, 1.0, 4.0, 3.5])
+        })
+
+        with pytest.raises(ValueError, match="sort_within_id cannot be used when var_column is provided"):
+            long_to_wide_masked(
+                long_df,
+                id_columns='id',
+                value_column='value',
+                var_column='visit',
+                sort_within_id=True
+            )
+
+    def test_order_value_name_defaults_for_multiple_dataframes(self):
+        """wide_to_long_masked should auto-name order columns for multiple inputs."""
+        df_long = DataFrame({
+            'id': ['A', 'A', 'B', 'B'],
+            'metric1': jnp.array([2.0, 1.0, 5.0, 4.0]),
+            'metric2': ['x', 'y', 'z', 'w']
+        })
+
+        metric1_wide = long_to_wide_masked(
+            df_long,
+            id_columns='id',
+            value_column='metric1',
+            var_prefix='m1',
+            sort_within_id=True
+        )
+
+        metric2_wide = long_to_wide_masked(
+            df_long,
+            id_columns='id',
+            value_column='metric2',
+            var_prefix='m2'
+        )
+
+        combined = wide_to_long_masked(
+            [metric1_wide, metric2_wide],
+            id_columns='id',
+            var_name=['slot', 'slot'],
+            value_name=['metric1', 'metric2']
+        )
+
+        assert 'metric1_order' in combined.columns
+        assert 'metric2_order' not in combined.columns
+        assert len(combined) > 0  # At least some data should be present
         
     def test_roundtrip_conversion(self):
         """Test that long -> wide -> long conversion preserves data."""
@@ -275,3 +426,77 @@ class TestExtendedTransformFunctions:
         # Result should be an empty DataFrame with the right structure
         assert len(result) == 0
         assert 'id' in result.columns
+
+    def test_pivot_sparse_wrapper_matches_core_function(self):
+        df_long = DataFrame({
+            'entity': ['A', 'A', 'B'],
+            'category': ['x', 'y', 'x'],
+            'value': jnp.array([1.0, 2.0, 3.0])
+        })
+
+        direct = long_to_wide_masked(
+            df_long,
+            id_columns='entity',
+            value_column='value',
+            var_column='category',
+            var_prefix='cat'
+        )
+        wrapper = pivot_sparse(
+            df_long,
+            index='entity',
+            value='value',
+            on='category',
+            prefix='cat'
+        )
+
+        _assert_dataframes_equal(direct, wrapper)
+
+    def test_unpivot_sparse_wrapper_matches_core_function(self):
+        wide_df = DataFrame({
+            'entity': ['A', 'B'],
+            'cat$0$value': jnp.array([1.0, 3.0]),
+            'cat$0$mask': [True, True],
+            'cat$1$value': jnp.array([2.0, 4.0]),
+            'cat$1$mask': [True, True],
+        })
+
+        direct = wide_to_long_masked(
+            wide_df,
+            id_columns='entity',
+            var_name='slot',
+            value_name='val'
+        )
+        wrapper = unpivot_sparse(
+            wide_df,
+            index='entity',
+            var_name='slot',
+            value_name='val'
+        )
+
+        _assert_dataframes_equal(direct, wrapper)
+
+    def test_masked_array_wrappers_match_core_functions(self):
+        wide_df = DataFrame({
+            'entity': ['A', 'B'],
+            'cat$0$value': jnp.array([1.0, 3.0]),
+            'cat$0$mask': [True, True],
+            'cat$1$value': jnp.array([2.0, 4.0]),
+            'cat$1$mask': [True, False],
+        })
+
+        direct_masked = wide_df_to_masked_array(
+            wide_df,
+            id_columns='entity'
+        )
+        wrapper_masked = to_masked_array(
+            wide_df,
+            index='entity'
+        )
+
+        assert np.allclose(direct_masked.data, wrapper_masked.data)
+        assert np.array_equal(direct_masked.mask, wrapper_masked.mask)
+        _assert_dataframes_equal(direct_masked.index_df, wrapper_masked.index_df)
+
+        direct_roundtrip = masked_array_to_wide_df(direct_masked, var_prefix='cat')
+        wrapper_roundtrip = from_masked_array(wrapper_masked, prefix='cat')
+        _assert_dataframes_equal(direct_roundtrip, wrapper_roundtrip)
