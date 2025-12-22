@@ -14,6 +14,7 @@ from .transform import (
     unpivot_sparse,
     to_masked_array,
     from_masked_array,
+    create_unpivot_skeleton,
 )
 
 __all__ = [
@@ -27,4 +28,5 @@ __all__ = [
     "unpivot_sparse",
     "to_masked_array",
     "from_masked_array",
+    "create_unpivot_skeleton",
 ]

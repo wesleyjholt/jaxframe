@@ -12,6 +12,116 @@ from .dataframe import DataFrame
 from .masked_array import MaskedArray
 
 
+def _is_jax_tracer(value: Any) -> bool:
+    """
+    Check if a value is a JAX tracer (used during JIT compilation).
+    
+    JAX tracers are abstract placeholders used during tracing and cannot be
+    meaningfully compared for equality at trace time.
+    
+    Args:
+        value: Value to check
+        
+    Returns:
+        True if the value is a JAX tracer, False otherwise
+    """
+    # Check by class name to avoid importing JAX (which may not be installed)
+    type_name = type(value).__name__
+    if 'Tracer' in type_name:
+        return True
+    
+    # Also check module path for more robustness
+    module = getattr(type(value), '__module__', '')
+    if module.startswith('jax') and 'Tracer' in type_name:
+        return True
+    
+    # Check for DynamicJaxprTracer specifically
+    if 'DynamicJaxprTracer' in type_name or 'JaxprTracer' in type_name:
+        return True
+        
+    return False
+
+
+def _validate_index_subdata_columns(
+    df: DataFrame,
+    index_columns: List[str],
+    index_subdata_columns: List[str]
+) -> None:
+    """
+    Validate that each index_subdata column has consistent values within each index group.
+    
+    A valid index_subdata column is one where all rows with the same index tuple
+    have identical values in that column.
+    
+    Note: Validation is skipped for JAX tracer values, as they cannot be meaningfully
+    compared during JIT tracing. The structural correctness will be validated when
+    the function is called with concrete values.
+    
+    Args:
+        df: Source DataFrame
+        index_columns: List of column names that identify each entity
+        index_subdata_columns: List of column names to validate as subdata
+        
+    Raises:
+        ValueError: If a column doesn't exist or has inconsistent values within an index group
+    """
+    for col in index_subdata_columns:
+        if col not in df.columns:
+            raise ValueError(
+                f"index_subdata_columns contains '{col}' which is not in the DataFrame"
+            )
+    
+    # Build index_tuple -> first_seen_value mapping for each subdata column
+    for col in index_subdata_columns:
+        index_to_value: Dict[Tuple[Any, ...], Any] = {}
+        
+        for row_idx in range(len(df)):
+            index_tuple = tuple(df[idx_col][row_idx] for idx_col in index_columns)
+            value = df[col][row_idx]
+            
+            # Skip validation for JAX tracers - they cannot be compared during tracing
+            if _is_jax_tracer(value):
+                continue
+            
+            # Make value comparable (handle JAX/numpy scalars)
+            comparable_value = value
+            if hasattr(value, 'item'):
+                try:
+                    comparable_value = value.item()
+                except Exception:
+                    pass
+            
+            if index_tuple in index_to_value:
+                first_value = index_to_value[index_tuple]
+                
+                # Fast path: same object reference
+                if first_value is comparable_value:
+                    continue
+                
+                # Skip if first_value was a tracer (shouldn't happen, but be safe)
+                if _is_jax_tracer(first_value):
+                    continue
+                
+                # Compare values
+                values_match = False
+                try:
+                    if hasattr(first_value, '__eq__'):
+                        values_match = bool(first_value == comparable_value)
+                    else:
+                        values_match = first_value == comparable_value
+                except Exception:
+                    values_match = False
+                
+                if not values_match:
+                    raise ValueError(
+                        f"Column '{col}' is not valid as index_subdata: "
+                        f"index {index_tuple} has conflicting values "
+                        f"{first_value!r} and {comparable_value!r}"
+                    )
+            else:
+                index_to_value[index_tuple] = comparable_value
+
+
 def _create_optimized_dataframe(data: Dict[str, Any]) -> DataFrame:
     """
     Create a DataFrame using the fastest available constructor based on data types.
@@ -225,9 +335,13 @@ def _apply_skeleton_order(
             raise ValueError(f"Index column '{col}' must exist in both long_df and long_skeleton_df")
         join_cols.append(col)
 
-    # Choose disambiguator - but skip value_name if it contains traced values
+    # Choose disambiguator - prefer 'variable' column (from create_unpivot_skeleton),
+    # then fall back to value_name or var_name
     disambiguator: Optional[str] = None
-    if value_name and value_name in long_df.columns and value_name in skeleton_df.columns and not value_is_traced:
+    if 'variable' in skeleton_df.columns and 'variable' in long_df.columns:
+        # Skeleton was created with create_unpivot_skeleton - use variable column
+        disambiguator = 'variable'
+    elif value_name and value_name in long_df.columns and value_name in skeleton_df.columns and not value_is_traced:
         disambiguator = value_name
     elif isinstance(var_name, str) and var_name in long_df.columns and var_name in skeleton_df.columns:
         disambiguator = var_name
@@ -798,7 +912,8 @@ def long_to_wide_masked(
     fill_type: Union[Any, str, List[Union[Any, str]]] = 0.0,
     mask_value: bool = False,
     sort_within_id: Union[bool, List[bool]] = False,
-    order_suffix: Optional[str] = 'order'
+    order_suffix: Optional[str] = 'order',
+    index_subdata_columns: Optional[List[str]] = None
 ) -> Union[DataFrame, List[DataFrame]]:
     """
     Convert a long format DataFrame to wide format with mask columns.
@@ -832,6 +947,11 @@ def long_to_wide_masked(
                   original position of each observation when
                   `sort_within_id` is enabled. Set to None to skip creating
                   these metadata columns.
+        index_subdata_columns: Optional list of column names in the DataFrame that
+                  should be carried forward to the wide format. These columns must
+                  have consistent values within each index group (all rows with the
+                  same index tuple must have identical values). The first value
+                  encountered for each entity will be used in the output.
     
     Returns:
         DataFrame(s) in wide format:
@@ -859,7 +979,8 @@ def long_to_wide_masked(
             fill_type,
             mask_value,
             sort_within_id=single_sort_flag,
-            order_suffix=order_suffix
+            order_suffix=order_suffix,
+            index_subdata_columns=index_subdata_columns
         )
     
     # Handle multiple columns case
@@ -922,7 +1043,8 @@ def long_to_wide_masked(
             fill_t,
             mask_value,
             sort_within_id=sort_flag,
-            order_suffix=order_suffix
+            order_suffix=order_suffix,
+            index_subdata_columns=index_subdata_columns if i == 0 else None  # Only add to first DataFrame
         )
         
         if i == 0:
@@ -1015,6 +1137,16 @@ class PivotStructure:
         self.unique_ids = unique_ids
         self.n_dest_rows = len(unique_ids)
         id_to_dest_row = {id_tuple: i for i, id_tuple in enumerate(unique_ids)}
+        
+        # Track first row index for each entity (useful for index_subdata extraction)
+        self.entity_first_row = np.zeros(self.n_dest_rows, dtype=np.int32)
+        entity_first_seen = set()
+        for row_idx in range(len(df)):
+            index_tuple = row_to_index_tuple[row_idx]
+            if index_tuple not in entity_first_seen:
+                dest_row = id_to_dest_row[index_tuple]
+                self.entity_first_row[dest_row] = row_idx
+                entity_first_seen.add(index_tuple)
         
         # Determine variable indices
         if var_column is not None:
@@ -1145,6 +1277,133 @@ class PivotStructure:
         self.source_to_dest_col = source_to_dest_col
         self.dest_fill_mask = ~dest_has_data  # True where we need fill values
         self.sort_permutation = sort_permutation
+
+
+def create_unpivot_skeleton(
+    df: DataFrame,
+    index_columns: Union[str, List[str]],
+    value_column: str,
+    *,
+    id_column: Optional[str] = None,
+    sort_within_index_group: bool = False,
+    var_column: Optional[str] = None,
+) -> DataFrame:
+    """
+    Create a skeleton DataFrame for unpivot operations.
+    
+    When you pivot data (long → wide) and then unpivot (wide → long), the rows
+    may come back in a different order. This function creates a skeleton that
+    captures the original row order and a "variable" column that maps each
+    original row to its wide-format slot.
+    
+    The returned skeleton can be passed to ``unpivot_sparse`` via the
+    ``long_skeleton_df`` parameter to restore original row ordering.
+    
+    Args:
+        df: Original long-format DataFrame (before pivoting)
+        index_columns: Column(s) that identify each entity/group
+        value_column: Column containing values that will be pivoted.
+            Used to determine sort order when ``sort_within_index_group=True``.
+        id_column: Optional primary key column to include in the skeleton.
+            If provided, this column will be preserved and can be used as
+            ``long_skeleton_id_column`` in ``unpivot_sparse``.
+        sort_within_index_group: Whether values are sorted within each group
+            during pivoting. Must match the setting used in ``pivot_sparse``.
+        var_column: Optional column specifying the variable index for each row.
+            If None, indices are assigned by position within each group.
+    
+    Returns:
+        DataFrame with columns:
+        
+        - All ``index_columns``
+        - ``'variable'``: The wide-format slot index for each row
+        - ``id_column`` (if provided): The primary key values
+    
+    Note:
+        If ``value_column`` contains JAX tracers, the function uses a position-based
+        approach that doesn't require concrete values, since the variable
+        assignment is purely structural when values can't be sorted.
+    
+    Example:
+        >>> # Original data
+        >>> long_df = DataFrame({
+        ...     'id_meas': ['01', '02', '03'],
+        ...     'id_person': ['A', 'A', 'B'],
+        ...     'value': jnp.array([1.0, 2.0, 3.0])
+        ... })
+        >>> 
+        >>> # Create skeleton before pivoting
+        >>> skeleton = create_unpivot_skeleton(
+        ...     df=long_df,
+        ...     index_columns='id_person',
+        ...     value_column='value',
+        ...     id_column='id_meas',
+        ...     sort_within_index_group=True
+        ... )
+        >>> 
+        >>> # Later, when unpivoting:
+        >>> long_restored = unpivot_sparse(
+        ...     wide_df,
+        ...     index='id_person',
+        ...     long_skeleton_df=skeleton,
+        ...     long_skeleton_id_column='id_meas'
+        ... )
+    """
+    if isinstance(index_columns, str):
+        index_columns = [index_columns]
+    else:
+        index_columns = list(index_columns)
+    
+    # Check if value column contains JAX tracers
+    values_are_traced = _has_jax_traced_values(df, value_column) if len(df) > 0 else False
+    
+    # Build the variable column based on the pivot structure
+    if var_column is not None:
+        # Variable column is explicitly provided - use it directly
+        variable_values = list(df[var_column])
+    elif values_are_traced or not sort_within_index_group:
+        # Position-based assignment: variable = position within each index group
+        # This works for:
+        # 1. Traced values (can't sort them anyway)
+        # 2. Non-sorted pivots (order is preserved)
+        index_key_counts: Dict[Tuple[Any, ...], int] = {}
+        variable_values: List[int] = []
+        for i in range(len(df)):
+            key = tuple(df[col][i] for col in index_columns)
+            var_in_group = index_key_counts.get(key, 0)
+            index_key_counts[key] = var_in_group + 1
+            variable_values.append(var_in_group)
+    else:
+        # Sorted pivot: need to compute variable based on sorted order
+        # This requires concrete values to determine sort order
+        structure = PivotStructure(
+            df=df,
+            index_columns=index_columns,
+            var_column=None,
+            sort_within_id=True,
+            value_column_for_sort=value_column,
+            use_jax_sort=False
+        )
+        # source_to_dest_col tells us which wide column each source row maps to
+        variable_values = list(structure.source_to_dest_col)
+    
+    # Build the skeleton DataFrame
+    skeleton_data: Dict[str, Any] = {}
+    
+    # Add index columns
+    for col in index_columns:
+        skeleton_data[col] = list(df[col])
+    
+    # Add variable column
+    skeleton_data['variable'] = variable_values
+    
+    # Add id column if provided
+    if id_column is not None:
+        if id_column not in df.columns:
+            raise ValueError(f"id_column '{id_column}' not found in DataFrame")
+        skeleton_data[id_column] = list(df[id_column])
+    
+    return _create_optimized_dataframe(skeleton_data)
 
 
 def _apply_pivot_structure_jax(
@@ -1557,7 +1816,8 @@ def _single_long_to_wide_masked(
     fill_type: Union[Any, str] = 0.0,
     mask_value: bool = False,
     sort_within_id: bool = False,
-    order_suffix: Optional[str] = 'order'
+    order_suffix: Optional[str] = 'order',
+    index_subdata_columns: Optional[List[str]] = None
 ) -> DataFrame:
     """
     Convert a single column from long format to wide format (internal helper function).
@@ -1568,6 +1828,11 @@ def _single_long_to_wide_masked(
     This function supports JAX JIT compilation when the value column contains
     JAX traced arrays. The structural computation is done in Python, and the
     value placement uses JAX-compatible scatter operations.
+    
+    Args:
+        index_subdata_columns: Optional list of column names that should be
+            carried forward to the wide format. Must have consistent values
+            within each index group.
     """
     # Check for invalid fill_types with string data
     if fill_type in ['local_max', 'global_max']:
@@ -1586,6 +1851,10 @@ def _single_long_to_wide_masked(
     if isinstance(index_columns, str):
         index_columns = [index_columns]
     
+    # Validate index_subdata_columns if provided
+    if index_subdata_columns:
+        _validate_index_subdata_columns(df, index_columns, index_subdata_columns)
+    
     # Check if we're dealing with JAX traced values - if so, use JIT-compatible path
     use_jax_path = _has_jax_traced_values(df, value_column)
     
@@ -1598,6 +1867,7 @@ def _single_long_to_wide_masked(
             var_prefix=var_prefix,
             fill_type=fill_type,
             mask_value=mask_value,
+            index_subdata_columns=index_subdata_columns,
             sort_within_id=sort_within_id,
             order_suffix=order_suffix
         )
@@ -1656,6 +1926,18 @@ def _single_long_to_wide_masked(
     wide_data = {col: [] for col in index_columns}
     record_original_order = sort_within_id and order_suffix is not None
     
+    # Track first row for each entity (for index_subdata extraction)
+    entity_first_row = {}
+    for row_idx in range(len(df)):
+        index_tuple = tuple(df[index_col][row_idx] for index_col in index_columns)
+        if index_tuple not in entity_first_row:
+            entity_first_row[index_tuple] = row_idx
+    
+    # Initialize index_subdata columns
+    if index_subdata_columns:
+        for col in index_subdata_columns:
+            wide_data[col] = []
+    
     # Create value and mask columns for each variable
     for var_idx in unique_vars:
         value_col_name = f"{var_prefix}${var_idx}$value"
@@ -1671,6 +1953,12 @@ def _single_long_to_wide_masked(
         # Add ID values
         for i, index_col in enumerate(index_columns):
             wide_data[index_col].append(index_tuple[i])
+        
+        # Add index_subdata values (from first row of this entity)
+        if index_subdata_columns:
+            first_row = entity_first_row[index_tuple]
+            for col in index_subdata_columns:
+                wide_data[col].append(df[col][first_row])
         
         if sort_within_id:
             observations = []  # List of (value, original_position)
@@ -1742,6 +2030,7 @@ def _single_long_to_wide_masked_jax(
     var_prefix: str = 'var',
     fill_type: Union[Any, str] = 0.0,
     mask_value: bool = False,
+    index_subdata_columns: Optional[List[str]] = None,
     sort_within_id: bool = False,
     order_suffix: Optional[str] = 'order'
 ) -> DataFrame:
@@ -1751,6 +2040,11 @@ def _single_long_to_wide_masked_jax(
     This function uses pre-computed pivot structure and JAX scatter operations
     to enable JIT compilation through pivot operations. When sort_within_id=True,
     sorting is performed using JAX's argsort for full JIT compatibility.
+    
+    Args:
+        index_subdata_columns: Optional list of column names that should be
+            carried forward to the wide format. Must have consistent values
+            within each index group.
     """
     import jax.numpy as jnp
     
@@ -1791,6 +2085,19 @@ def _single_long_to_wide_masked_jax(
     # Add index columns
     for i, index_col in enumerate(index_columns):
         wide_data[index_col] = [id_tuple[i] for id_tuple in structure.unique_ids]
+    
+    # Add index_subdata columns using entity_first_row mapping
+    if index_subdata_columns:
+        for col in index_subdata_columns:
+            col_data = df[col]
+            # Check if this column contains traced values
+            if len(col_data) > 0 and _is_jax_traced(col_data[0]):
+                # Use JAX gather for traced values
+                col_array = jnp.stack([col_data[i] for i in range(len(col_data))])
+                wide_data[col] = col_array[structure.entity_first_row]
+            else:
+                # Use Python indexing for non-traced values
+                wide_data[col] = [col_data[i] for i in structure.entity_first_row]
     
     # Add value, mask, and order columns for each variable slot
     for col_idx, var_idx in enumerate(structure.unique_vars):
@@ -2054,7 +2361,8 @@ def pivot_sparse(
     fill_type: Union[Any, str, List[Union[Any, str]]] = None,
     mask_value: bool = False,
     sort_within_index_group: Union[bool, List[bool]] = False,
-    order_suffix: Optional[str] = None
+    order_suffix: Optional[str] = None,
+    index_subdata: Optional[List[str]] = None
 ) -> Union[DataFrame, List[DataFrame]]:
     """Polars-style interface to :func:`long_to_wide_masked`.
 
@@ -2075,6 +2383,9 @@ def pivot_sparse(
             slotting; forwarded unchanged.
         order_suffix: Suffix for the extra column that records the original
             order when ``sort_within_index_group`` is True.
+        index_subdata: Optional list of column names that should be
+            carried forward to the wide format. Must have consistent values
+            within each index group.
     """
     if prefix is None:
         if isinstance(value, list):
@@ -2101,6 +2412,7 @@ def pivot_sparse(
         mask_value=mask_value,
         sort_within_id=sort_within_index_group,
         order_suffix=order_suffix,
+        index_subdata_columns=index_subdata,
     )
 
 

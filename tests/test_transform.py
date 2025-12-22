@@ -1417,3 +1417,175 @@ def test_unpivot_sparse_jit_roundtrip():
     assert jnp.allclose(result_jit, values), f"JIT roundtrip failed: {result_jit} != {values}"
     assert jnp.allclose(result_no_jit, values), f"No-JIT roundtrip failed: {result_no_jit} != {values}"
     assert jnp.allclose(result_jit, result_no_jit), "JIT/no-JIT unpivot mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Tests for index_subdata_columns feature
+# ---------------------------------------------------------------------------
+
+
+def test_pivot_with_index_subdata_columns_basic():
+    """Test basic index_subdata_columns propagation to wide format."""
+    df = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'category': ['X', 'X', 'Y', 'Y'],  # Valid: same within each id
+        'value': [1.0, 2.0, 3.0, 4.0],
+    })
+    
+    wide = long_to_wide_masked(
+        df, 'id', 'value', 
+        index_subdata_columns=['category']
+    )
+    
+    assert 'category' in wide.columns
+    assert list(wide['category']) == ['X', 'Y']
+    assert list(wide['id']) == ['a', 'b']
+
+
+def test_pivot_with_multiple_index_subdata_columns():
+    """Test multiple index_subdata columns."""
+    df = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'group': ['G1', 'G1', 'G2', 'G2'],
+        'weight': [0.5, 0.5, 0.8, 0.8],
+        'value': [1.0, 2.0, 3.0, 4.0],
+    })
+    
+    wide = long_to_wide_masked(
+        df, 'id', 'value',
+        index_subdata_columns=['group', 'weight']
+    )
+    
+    assert list(wide['group']) == ['G1', 'G2']
+    assert list(wide['weight']) == [0.5, 0.8]
+
+
+def test_pivot_index_subdata_invalid_column_not_found():
+    """Test error when index_subdata column doesn't exist."""
+    df = DataFrame({'id': ['a', 'b'], 'value': [1, 2]})
+    
+    with pytest.raises(ValueError, match="not in the DataFrame"):
+        long_to_wide_masked(df, 'id', 'value', index_subdata_columns=['missing'])
+
+
+def test_pivot_index_subdata_invalid_inconsistent_values():
+    """Test error when index_subdata has different values for same index."""
+    df = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'category': ['X', 'Z', 'Y', 'Y'],  # Invalid: 'a' has both 'X' and 'Z'
+        'value': [1.0, 2.0, 3.0, 4.0],
+    })
+    
+    with pytest.raises(ValueError, match="conflicting values"):
+        long_to_wide_masked(df, 'id', 'value', index_subdata_columns=['category'])
+
+
+def test_pivot_index_subdata_with_sorting():
+    """Test index_subdata works correctly with sort_within_id."""
+    df = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'meta': ['M1', 'M1', 'M2', 'M2'],
+        'value': [2.0, 1.0, 4.0, 3.0],  # Will be sorted
+    })
+    
+    wide = long_to_wide_masked(
+        df, 'id', 'value',
+        sort_within_id=True,
+        index_subdata_columns=['meta']
+    )
+    
+    assert list(wide['meta']) == ['M1', 'M2']
+
+
+def test_pivot_index_subdata_with_pivot_sparse():
+    """Test index_subdata with pivot_sparse wrapper."""
+    from jaxframe.transform import pivot_sparse
+    
+    df = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'category': ['X', 'X', 'Y', 'Y'],
+        'value': [1.0, 2.0, 3.0, 4.0],
+    })
+    
+    wide = pivot_sparse(
+        df, index='id', value='value',
+        index_subdata=['category']
+    )
+    
+    assert 'category' in wide.columns
+    assert list(wide['category']) == ['X', 'Y']
+
+
+@pytest.mark.skipif(not jax_available, reason="JAX not available")
+def test_pivot_index_subdata_jax_jit():
+    """Test index_subdata with JAX JIT compilation."""
+    from jaxframe.transform import pivot_sparse
+    import jax
+    
+    source_table = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'weight': [0.5, 0.5, 0.8, 0.8],
+    })
+    
+    @jax.jit
+    def pivot_fn(values):
+        df = source_table.add_column('value', values)
+        wide = pivot_sparse(
+            df, index='id', value='value',
+            index_subdata=['weight']
+        )
+        return wide['var$0$value']
+    
+    values = jnp.array([1.0, 2.0, 3.0, 4.0])
+    result = pivot_fn(values)
+    
+    # Should get first value per entity
+    assert jnp.allclose(result, jnp.array([1.0, 3.0]))
+
+
+@pytest.mark.skipif(not jax_available, reason="JAX not available")
+def test_pivot_index_subdata_with_jax_subdata_column():
+    """Test when the subdata column itself contains JAX arrays."""
+    df = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'weight': jnp.array([0.5, 0.5, 0.8, 0.8]),  # JAX array
+        'value': jnp.array([1.0, 2.0, 3.0, 4.0]),
+    })
+    
+    wide = long_to_wide_masked(
+        df, 'id', 'value',
+        index_subdata_columns=['weight']
+    )
+    
+    # weight column should be preserved correctly
+    weight_values = wide['weight']
+    assert jnp.allclose(jnp.array([weight_values[0], weight_values[1]]), jnp.array([0.5, 0.8]))
+
+
+@pytest.mark.skipif(not jax_available, reason="JAX not available")
+def test_pivot_index_subdata_jax_jit_with_sorting():
+    """Test index_subdata with JAX JIT and sorting enabled."""
+    from jaxframe.transform import pivot_sparse
+    import jax
+    
+    source_table = DataFrame({
+        'id': ['a', 'a', 'b', 'b'],
+        'meta': ['M1', 'M1', 'M2', 'M2'],
+    })
+    
+    @jax.jit
+    def pivot_fn(values):
+        df = source_table.add_column('value', values)
+        wide = pivot_sparse(
+            df, index='id', value='value',
+            sort_within_index_group=True,
+            index_subdata=['meta']
+        )
+        return wide['var$0$value']
+    
+    # Values will be sorted within each entity
+    values = jnp.array([2.0, 1.0, 4.0, 3.0])
+    result = pivot_fn(values)
+    
+    # After sorting: a=[1.0, 2.0], b=[3.0, 4.0], first slot values are 1.0 and 3.0
+    assert jnp.allclose(result, jnp.array([1.0, 3.0]))
