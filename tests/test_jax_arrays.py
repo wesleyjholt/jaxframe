@@ -108,7 +108,7 @@ def test_jax_array_to_dict():
 
 
 # @pytest.mark.skipif(not JAX_AVAILABLE, reason="JAX not available")
-def test_jax_array_join():
+def test_jax_array_join_column():
     """Test that join works correctly with JAX arrays."""
     
     # Create DataFrames with JAX arrays
@@ -125,14 +125,14 @@ def test_jax_array_join():
     df2 = DataFrame(df2_data, name="df2")
     
     # Join JAX array column
-    result = df1.join(df2, on='id', source='value2')
+    result = df1.join(df2, on='id', how='inner')
     
     # Check that the joined column is properly handled
-    assert 'df2/value2' in result.columns, "Joined column should be present"
-    assert result.column_types['df2/value2'] == 'jax_array', "Joined JAX array should remain jax_array type"
+    assert 'value2' in result.columns, "Joined column should be present"
+    assert result.column_types['value2'] == 'jax_array', "Joined JAX array should remain jax_array type"
     
     # Check values
-    joined_values = result['df2/value2']
+    joined_values = result['value2']
     assert hasattr(joined_values, 'shape'), "Joined JAX array should remain JAX array"
     assert not isinstance(joined_values, np.ndarray), "Joined JAX array should not become numpy array"
     assert list(joined_values) == [10.0, 20.0, 30.0], "Joined values should be correct"

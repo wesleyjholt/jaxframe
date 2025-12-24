@@ -217,7 +217,41 @@ def test_name_attribute():
     assert selected_df.name == "test_df_selected"
 
 
-def test_join():
+def test_rename_with_mapping():
+    df = DataFrame({'a': [1, 2], 'b': [3, 4]})
+
+    renamed = df.rename({'a': 'alpha', 'b': 'beta'})
+
+    assert df.columns == ('a', 'b')
+    assert renamed.columns == ('alpha', 'beta')
+    assert renamed.dtypes['alpha'] == df.dtypes['a']
+    assert renamed.dtypes['beta'] == df.dtypes['b']
+    assert list(renamed['alpha']) == [1, 2]
+    assert list(renamed['beta']) == [3, 4]
+
+
+def test_rename_with_sequence_and_function():
+    df = DataFrame({'foo': [1, 2], 'bar': [3, 4], 'baz': [5, 6]})
+
+    renamed = df.rename([('foo', 'first')], function=lambda name: name.upper())
+
+    assert renamed.columns == ('FIRST', 'BAR', 'BAZ')
+    assert list(renamed['FIRST']) == [1, 2]
+    assert list(renamed['BAR']) == [3, 4]
+    assert list(renamed['BAZ']) == [5, 6]
+
+
+def test_rename_errors():
+    df = DataFrame({'a': [1], 'b': [2]})
+
+    with pytest.raises(KeyError):
+        df.rename({'missing': 'x'})
+
+    with pytest.raises(ValueError, match="duplicate column names"):
+        df.rename({'a': 'b'})
+
+
+def test_join_column():
     """Test the join method."""
     # Create first DataFrame (like sample_assay_df)
     df1_data = {
@@ -233,60 +267,72 @@ def test_join():
     }
     df2 = DataFrame(df2_data, name="params")
     
-    # Test basic join (using left join to preserve original row order)
-    result = df1.join(df2, on='assay_id', source='var', how='left')
+    # Test basic join - Polars syntax includes all columns from right DataFrame
+    result = df1.join(df2, on='assay_id', how='inner')
     
-    # Check that new column was added with correct name
-    assert 'params/var' in result.columns
-    assert result.shape == (5, 3)
+    # Check that new column was added
+    assert 'var' in result.columns
+    assert result.shape == (5, 3)  # sample_id, assay_id, var
     
     # Check values are correctly mapped
     expected_var_values = [10, 10, 20, 20, 10]  # Based on assay_id mapping
-    assert list(result['params/var']) == expected_var_values
+    assert list(result['var']) == expected_var_values
     
     # Check original columns are preserved
     assert list(result['sample_id']) == ['001', '002', '003', '001', '002']
     assert list(result['assay_id']) == ['01', '01', '02', '02', '01']
     
-    # Test custom target column name
-    result2 = df1.join(df2, on='assay_id', source='var', 
-                      target='custom_var', how='left')
-    assert 'custom_var' in result2.columns
-    assert 'params/var' not in result2.columns
+    # Test with column name conflict - suffix should be applied
+    df2_conflict = DataFrame({
+        'assay_id': ['01', '02'],
+        'sample_id': ['X01', 'X02']  # Conflicts with df1.sample_id
+    })
+    result2 = df1.join(df2_conflict, on='assay_id', how='inner', suffix='_params')
+    assert 'sample_id' in result2.columns  # Original from left
+    assert 'sample_id_params' in result2.columns  # From right with suffix
     
-    # Test with DataFrame without name
-    df2_no_name = DataFrame(df2_data)
-    result3 = df1.join(df2_no_name, on='assay_id', source='var', how='left')
-    assert 'var' in result3.columns  # Should use source name when no name
+    # Test with different column names using left_on/right_on
+    df2_renamed = DataFrame({
+        'param_id': ['01', '02'],  # Different name for join column
+        'var': [10, 20]
+    })
+    result3 = df1.join(df2_renamed, left_on='assay_id', right_on='param_id', how='inner')
+    assert 'var' in result3.columns
+    assert 'param_id' in result3.columns  # Right join column is included
+    assert list(result3['var']) == expected_var_values
     
     # Test error conditions
     with pytest.raises(KeyError):
-        df1.join(df2, on='nonexistent', source='var')
+        df1.join(df2, on='nonexistent', how='inner')
     
-    with pytest.raises(KeyError):
-        df1.join(df2, on='assay_id', source='nonexistent')
-    
-    # Test duplicate values in join column
+    # Test duplicate values in join column - this should work fine in Polars-style joins
+    # as they can handle duplicates (unlike lookup table operations)
     df2_duplicates = DataFrame({
         'assay_id': ['01', '01'],  # Duplicate
         'var': [10, 20]
     })
-    with pytest.raises(ValueError, match="Duplicate values found"):
-        df1.join(df2_duplicates, on='assay_id', source='var')
+    # This should work - joins can handle duplicates
+    result_dup = df1.join(df2_duplicates, on='assay_id', how='inner')
+    assert len(result_dup) > 0  # Should produce results
     
-    # Test missing value in lookup - with inner join default, missing keys result in empty result
+    # Test inner join behavior: missing value in lookup should result in empty DataFrame
     df1_missing = DataFrame({
         'sample_id': ['001'],
         'assay_id': ['03']  # Not in df2
     })
-    result_missing = df1_missing.join(df2, on='assay_id', source='var')
-    # With inner join default, missing keys result in empty result (no rows)
-    assert len(result_missing) == 0
+    result_missing = df1_missing.join(df2, on='assay_id', how='inner')
+    assert len(result_missing) == 0, "Inner join with no matching keys should return empty DataFrame"
+    assert result_missing.shape[1] == 3, "Should have all columns even when empty"  # sample_id, assay_id, var
     
-    # Test that left join still produces NaN for missing values
-    result_missing_left = df1_missing.join(df2, on='assay_id', source='var', how='left')
-    assert len(result_missing_left) == 1
-    assert np.isnan(result_missing_left['params/var'][0])
+    # Test partial match - some rows match, some don't
+    df1_partial = DataFrame({
+        'sample_id': ['001', '002', '003'],
+        'assay_id': ['01', '03', '02']  # '03' is not in df2
+    })
+    result_partial = df1_partial.join(df2, on='assay_id', how='inner')
+    assert len(result_partial) == 2, "Should include only matching rows"
+    assert list(result_partial['assay_id']) == ['01', '02'], "Should include only rows with matching keys"
+    assert list(result_partial['var']) == [10, 20], "Should have correct joined values"
 
 
 def test_join_multiple_columns():
@@ -307,12 +353,11 @@ def test_join_multiple_columns():
     }
     df2 = DataFrame(df2_data, name="treatments")
     
-    # Test joining multiple columns with automatic naming (using left join to preserve order)
-    result = df1.join(df2, on='treatment_id', 
-                     source=['dose', 'duration', 'category'], how='left')
+    # Test joining all columns from right DataFrame (Polars behavior)
+    result = df1.join(df2, on='treatment_id', how='inner')
     
-    # Check that all new columns were added with correct names
-    expected_new_columns = ['treatments/dose', 'treatments/duration', 'treatments/category']
+    # Check that all new columns were added (no prefixing in Polars by default)
+    expected_new_columns = ['dose', 'duration', 'category']
     for col in expected_new_columns:
         assert col in result.columns, f"Missing column: {col}"
     
@@ -324,43 +369,278 @@ def test_join_multiple_columns():
     expected_duration_values = [30, 60, 30]    # T1->30, T2->60, T1->30
     expected_category_values = ['A', 'B', 'A']  # T1->A, T2->B, T1->A
     
-    assert list(result['treatments/dose']) == expected_dose_values
-    assert list(result['treatments/duration']) == expected_duration_values
-    assert list(result['treatments/category']) == expected_category_values
+    assert list(result['dose']) == expected_dose_values
+    assert list(result['duration']) == expected_duration_values
+    assert list(result['category']) == expected_category_values
     
-    # Test joining multiple columns with custom naming
-    result2 = df1.join(df2, on='treatment_id',
-                      source=['dose', 'duration'],
-                      target=['custom_dose', 'custom_duration'], how='left')
+    # Test with column name conflicts - suffix should be applied
+    df2_conflict = DataFrame({
+        'treatment_id': ['T1', 'T2'],
+        'sample_id': ['X1', 'X2'],  # Conflicts with df1.sample_id
+        'dose': [10.0, 20.0]
+    })
+    result2 = df1.join(df2_conflict, on='treatment_id', how='inner', suffix='_treatment')
     
-    assert 'custom_dose' in result2.columns
-    assert 'custom_duration' in result2.columns
-    assert 'treatments/dose' not in result2.columns
-    assert 'treatments/duration' not in result2.columns
+    assert 'sample_id' in result2.columns  # Original from left
+    assert 'sample_id_treatment' in result2.columns  # From right with suffix
+    assert 'dose' in result2.columns  # No conflict, no suffix needed
     
-    # Check values are still correct
-    assert list(result2['custom_dose']) == expected_dose_values
-    assert list(result2['custom_duration']) == expected_duration_values
+    # Check values are still correct for the conflicting column test
+    expected_sample_ids_treatment = ['X1', 'X2', 'X1']  # T1->X1, T2->X2, T1->X1
+    assert list(result2['sample_id_treatment']) == expected_sample_ids_treatment
     
-    # Test error: mismatched target length
-    with pytest.raises(ValueError, match="Length of target list"):
-        df1.join(df2, on='treatment_id',
-                source=['dose', 'duration'],
-                target=['only_one_name'])  # Should be 2 names
+    # Test that types are preserved in Polars-style join
+    assert isinstance(result['dose'][0], (float, np.floating))  # numpy array
+    assert isinstance(result['duration'][0], int)  # list
+    assert isinstance(result['category'][0], str)  # list
+
+
+def test_join_inner_join_behavior():
+    """Test that join behaves like an inner join, excluding non-matching rows."""
+    # Create test DataFrames with some matching and some non-matching keys
+    left_data = {
+        'id': ['A', 'B', 'C', 'D', 'E'],
+        'left_value': [1, 2, 3, 4, 5]
+    }
+    left_df = DataFrame(left_data, name="left")
     
-    # Test with DataFrame without name (should use source column names)
-    df2_no_name = DataFrame(df2_data)
-    result3 = df1.join(df2_no_name, on='treatment_id',
-                      source=['dose', 'duration'])
+    right_data = {
+        'id': ['B', 'D', 'F'],  # Only B and D match with left
+        'right_value': [20, 40, 60]
+    }
+    right_df = DataFrame(right_data, name="right")
     
-    assert 'dose' in result3.columns
-    assert 'duration' in result3.columns
-    assert 'treatments/dose' not in result3.columns
+    # Perform inner join
+    result = left_df.join(right_df, on='id', how='inner')
     
-    # Test that types are preserved
-    assert isinstance(result['treatments/dose'][0], (float, np.floating))  # numpy array
-    assert isinstance(result['treatments/duration'][0], int)  # list
-    assert isinstance(result['treatments/category'][0], str)  # list
+    # Should only include rows where keys match
+    assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
+    assert list(result['id']) == ['B', 'D'], f"Expected ['B', 'D'], got {list(result['id'])}"
+    assert list(result['left_value']) == [2, 4], f"Expected [2, 4], got {list(result['left_value'])}"
+    assert list(result['right_value']) == [20, 40], f"Expected [20, 40], got {list(result['right_value'])}"
+    
+    # Test with JAX arrays
+    try:
+        import jax.numpy as jnp
+        
+        left_jax_data = {
+            'id': ['A', 'B', 'C'],
+            'values': jnp.array([1.0, 2.0, 3.0])
+        }
+        left_jax_df = DataFrame(left_jax_data, name="left_jax")
+        
+        right_jax_data = {
+            'id': ['B', 'D'],  # Only B matches
+            'other_values': jnp.array([20.0, 40.0])
+        }
+        right_jax_df = DataFrame(right_jax_data, name="right_jax")
+        
+        result_jax = left_jax_df.join(right_jax_df, on='id', how='inner')
+        
+        # Should only include the matching row
+        assert len(result_jax) == 1, f"Expected 1 row, got {len(result_jax)}"
+        assert result_jax['id'][0] == 'B', f"Expected 'B', got {result_jax['id'][0]}"
+        assert abs(result_jax['values'][0] - 2.0) < 1e-10, f"Expected 2.0, got {result_jax['values'][0]}"
+        assert abs(result_jax['other_values'][0] - 20.0) < 1e-10, f"Expected 20.0, got {result_jax['other_values'][0]}"
+        
+        # Verify JAX array types are preserved
+        assert result_jax.column_types['values'] == 'jax_array'
+        assert result_jax.column_types['other_values'] == 'jax_array'
+        
+    except ImportError:
+        pass  # Skip JAX test if not available
+
+
+def test_join_semi_join():
+    """Test the join method with how='semi' for semi-join operations."""
+    # Create test DataFrames
+    customers_data = {
+        'customer_id': ['C1', 'C2', 'C3', 'C4', 'C5'],
+        'name': ['Alice', 'Bob', 'Charlie', 'David', 'Eve'],
+        'city': ['NY', 'LA', 'NY', 'SF', 'LA']
+    }
+    customers = DataFrame(customers_data, name="customers")
+    
+    orders_data = {
+        'order_id': ['O1', 'O2', 'O3', 'O4', 'O5'],
+        'customer_id': ['C1', 'C1', 'C3', 'C3', 'C5'],  # C2 and C4 have no orders
+        'amount': [100, 150, 200, 75, 300]
+    }
+    orders = DataFrame(orders_data, name="orders")
+    
+    # Test basic semi-join
+    customers_with_orders = customers.join(orders, on='customer_id', how='semi')
+    
+    # Should only include customers who have orders: C1, C3, C5
+    assert len(customers_with_orders) == 3, f"Expected 3 customers, got {len(customers_with_orders)}"
+    
+    expected_customers = ['C1', 'C3', 'C5']
+    actual_customers = list(customers_with_orders['customer_id'])
+    assert actual_customers == expected_customers, f"Expected {expected_customers}, got {actual_customers}"
+    
+    # Should preserve original column structure
+    assert list(customers_with_orders.columns) == list(customers.columns)
+    assert customers_with_orders.columns == ('customer_id', 'name', 'city')
+    
+    # Should not add any columns from orders DataFrame
+    assert 'order_id' not in customers_with_orders.columns
+    assert 'amount' not in customers_with_orders.columns
+    
+    # Check specific values
+    assert customers_with_orders['name'][0] == 'Alice'  # C1
+    assert customers_with_orders['name'][1] == 'Charlie'  # C3
+    assert customers_with_orders['name'][2] == 'Eve'  # C5
+
+
+def test_join_semi_duplicate_elimination():
+    """Test that join with how='semi' eliminates duplicates automatically."""
+    # Create DataFrames where left has duplicates and right has multiple matches
+    left_data = {
+        'id': ['A', 'A', 'B', 'B', 'C'],  # Duplicates in left
+        'value': [1, 1, 2, 2, 3]
+    }
+    left_df = DataFrame(left_data, name="left")
+    
+    right_data = {
+        'id': ['A', 'A', 'A', 'B'],  # Multiple matches for A and B
+        'other': [10, 20, 30, 40]
+    }
+    right_df = DataFrame(right_data, name="right")
+    
+    result = left_df.join(right_df, on='id', how='semi')
+    
+    # Should eliminate duplicates - only one row for each unique key
+    assert len(result) == 2, f"Expected 2 unique rows, got {len(result)}"
+    assert list(result['id']) == ['A', 'B'], f"Expected ['A', 'B'], got {list(result['id'])}"
+    assert list(result['value']) == [1, 2], f"Expected [1, 2], got {list(result['value'])}"
+
+
+def test_join_semi_multi_column():
+    """Test join with how='semi' with multi-column joins."""
+    # Create test data for multi-column join
+    users_data = {
+        'user_id': ['U1', 'U2', 'U3', 'U4'],
+        'region': ['US', 'US', 'EU', 'EU'],
+        'active': [True, False, True, True]
+    }
+    users = DataFrame(users_data, name="users")
+    
+    sessions_data = {
+        'session_id': ['S1', 'S2', 'S3'],
+        'user_id': ['U1', 'U3', 'U1'],
+        'region': ['US', 'EU', 'US'],
+        'duration': [30, 45, 60]
+    }
+    sessions = DataFrame(sessions_data, name="sessions")
+    
+    # Find users who have sessions in their region
+    active_users = users.join(sessions, on=['user_id', 'region'], how='semi')
+    
+    # Should find U1 (US) and U3 (EU), but not U2 or U4
+    assert len(active_users) == 2, f"Expected 2 users, got {len(active_users)}"
+    assert list(active_users['user_id']) == ['U1', 'U3']
+    assert list(active_users['region']) == ['US', 'EU']
+
+
+def test_join_semi_with_jax_arrays():
+    """Test join with how='semi' with JAX arrays."""
+    try:
+        import jax.numpy as jnp
+        
+        # Create DataFrames with JAX arrays
+        left_data = {
+            'id': ['A', 'B', 'C', 'D'],
+            'values': jnp.array([1.0, 2.0, 3.0, 4.0])
+        }
+        left_df = DataFrame(left_data, name="left")
+        
+        right_data = {
+            'id': ['B', 'D', 'E'],
+            'other_values': jnp.array([20.0, 40.0, 50.0])
+        }
+        right_df = DataFrame(right_data, name="right")
+        
+        result = left_df.join(right_df, on='id', how='semi')
+        
+        # Should include B and D
+        assert len(result) == 2, f"Expected 2 rows, got {len(result)}"
+        assert list(result['id']) == ['B', 'D']
+        assert abs(result['values'][0] - 2.0) < 1e-10
+        assert abs(result['values'][1] - 4.0) < 1e-10
+        
+        # Verify JAX array type is preserved
+        assert result.column_types['values'] == 'jax_array'
+        
+    except ImportError:
+        pass  # Skip JAX test if not available
+
+
+def test_join_semi_empty_result():
+    """Test join with how='semi' when no matches are found."""
+    left_data = {
+        'id': ['A', 'B', 'C'],
+        'value': [1, 2, 3]
+    }
+    left_df = DataFrame(left_data, name="left")
+    
+    right_data = {
+        'id': ['X', 'Y', 'Z'],
+        'other': [10, 20, 30]
+    }
+    right_df = DataFrame(right_data, name="right")
+    
+    result = left_df.join(right_df, on='id', how='semi')
+    
+    # Should return empty DataFrame with same structure
+    assert len(result) == 0, f"Expected empty result, got {len(result)} rows"
+    assert list(result.columns) == list(left_df.columns)
+    assert result.name == left_df.name
+
+
+def test_join_semi_error_conditions():
+    """Test error conditions for join method with how='semi'."""
+    left_data = {
+        'id': ['A', 'B'],
+        'value': [1, 2]
+    }
+    left_df = DataFrame(left_data)
+    
+    right_data = {
+        'other_id': ['A', 'B'],
+        'other_value': [10, 20]
+    }
+    right_df = DataFrame(right_data)
+    
+    # Test missing column in left DataFrame
+    with pytest.raises(KeyError, match="Column 'missing' not found in left DataFrame"):
+        left_df.join(right_df, on='missing', how='semi')
+    
+    # Test missing column in right DataFrame
+    with pytest.raises(KeyError, match="Column 'id' not found in right DataFrame"):
+        left_df.join(right_df, on='id', how='semi')
+
+
+def test_join_how_parameter_validation():
+    """Test validation of the 'how' parameter."""
+    left_data = {
+        'id': ['A', 'B'],
+        'value': [1, 2]
+    }
+    left_df = DataFrame(left_data)
+    
+    right_data = {
+        'id': ['A', 'B'],
+        'other_value': [10, 20]
+    }
+    right_df = DataFrame(right_data)
+    
+    # Test invalid 'how' parameter
+    with pytest.raises(ValueError, match="'how' must be one of"):
+        left_df.join(right_df, on='id', how='invalid')
+    
+    # Test basic inner join works without needing source parameter (Polars behavior)
+    result = left_df.join(right_df, on='id', how='inner')
+    assert len(result) == 2  # Should work fine
 
 
 def test_add_column():
@@ -742,3 +1022,36 @@ def test_concat_non_dataframe():
     
     with pytest.raises(TypeError, match="Can only concatenate with another DataFrame"):
         df1.concat("not a dataframe")
+
+
+def test_polars_api_compatibility():
+    """Test Polars-like API features for compatibility."""
+    # Create test DataFrame with mixed data types
+    data = {
+        'strings': ['a', 'b', 'c'],
+        'integers': [1, 2, 3],
+        'floats': [1.1, 2.2, 3.3],
+        'numpy_ints': np.array([10, 20, 30]),
+        'numpy_floats': np.array([1.5, 2.5, 3.5])
+    }
+    df = DataFrame(data)
+    
+    # Test dtypes property (not method) - Polars compatibility
+    dtypes_result = df.dtypes
+    assert isinstance(dtypes_result, dict)
+    assert dtypes_result['strings'] == 'str'  # Element type, not container
+    assert dtypes_result['integers'] == 'int'  # Element type, not container
+    assert dtypes_result['floats'] == 'float'  # Element type, not container
+    assert dtypes_result['numpy_ints'] == 'int64'
+    assert dtypes_result['numpy_floats'] == 'float64'
+    
+    # Test schema property - Polars compatibility  
+    schema_result = df.schema
+    assert isinstance(schema_result, dict)
+    assert schema_result == dtypes_result  # Should be identical to dtypes
+    
+    # Verify dtypes and schema are properties, not methods
+    assert hasattr(DataFrame, 'dtypes')
+    assert hasattr(DataFrame, 'schema')
+    assert isinstance(getattr(DataFrame, 'dtypes'), property)
+    assert isinstance(getattr(DataFrame, 'schema'), property)
