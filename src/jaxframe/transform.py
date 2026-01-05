@@ -8,6 +8,34 @@ including wide-to-long format conversions with mask support.
 from typing import List, Tuple, Any, Union, Optional, Dict
 import re
 import numpy as np
+
+
+def _jaxframe_profile_enabled() -> bool:
+    import os
+
+    return os.environ.get("JAXFRAME_PROFILE_TRANSFORM", "0") in {"1", "true", "True", "yes", "YES"}
+
+
+class _JaxframeTimer:
+    def __init__(self, label: str):
+        self.label = label
+        self._t0 = None
+
+    def __enter__(self):
+        if _jaxframe_profile_enabled():
+            from time import perf_counter
+
+            self._t0 = perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._t0 is None:
+            return False
+        from time import perf_counter
+
+        dt = perf_counter() - self._t0
+        print(f"[JAXFRAME-TIMING] {self.label}: {dt:.3f}s")
+        return False
 from .dataframe import DataFrame
 from .masked_array import MaskedArray
 
@@ -2050,70 +2078,78 @@ def _single_long_to_wide_masked_jax(
     
     # Compute the pivot structure (this is Python, not traced)
     # Use JAX sorting when sort_within_id is True
-    structure = PivotStructure(
-        df=df,
-        index_columns=index_columns,
-        var_column=var_column,
-        sort_within_id=sort_within_id,
-        value_column_for_sort=None,  # Don't use Python sorting
-        use_jax_sort=sort_within_id  # Use JAX sorting instead
-    )
+    with _JaxframeTimer("pivot/PivotStructure"):
+        structure = PivotStructure(
+            df=df,
+            index_columns=index_columns,
+            var_column=var_column,
+            sort_within_id=sort_within_id,
+            value_column_for_sort=None,  # Don't use Python sorting
+            use_jax_sort=sort_within_id  # Use JAX sorting instead
+        )
     
     # Extract values as a JAX array (this is the traced part)
-    values_list = [df[value_column][i] for i in range(len(df))]
-    values = jnp.stack(values_list)
+    with _JaxframeTimer("pivot/extract_values"):
+        col_data = df[value_column]
+        if hasattr(col_data, "shape") and getattr(col_data, "shape")[0] == len(df):
+            values = jnp.asarray(col_data)
+        else:
+            values_list = [col_data[i] for i in range(len(df))]
+            values = jnp.stack(values_list)
     
     # Apply the pivot using appropriate method
     # Pass fill_type directly - the apply functions handle local_max/global_max
     record_original_order = sort_within_id and order_suffix is not None
     
-    if structure.requires_jax_sort:
-        # Use JAX-based sorting
-        wide_values, mask_array, wide_order = _apply_pivot_structure_jax_sorted(
-            values, structure, fill_type
-        )
-    else:
-        # Use regular scatter (no sorting)
-        wide_values = _apply_pivot_structure_jax(values, structure, fill_type)
-        # Build the mask (not traced, just numpy)
-        mask_array = ~structure.dest_fill_mask  # numpy array, not jax
-        wide_order = None
+    with _JaxframeTimer("pivot/apply_structure"):
+        if structure.requires_jax_sort:
+            # Use JAX-based sorting
+            wide_values, mask_array, wide_order = _apply_pivot_structure_jax_sorted(
+                values, structure, fill_type
+            )
+        else:
+            # Use regular scatter (no sorting)
+            wide_values = _apply_pivot_structure_jax(values, structure, fill_type)
+            # Build the mask (not traced, just numpy)
+            mask_array = ~structure.dest_fill_mask  # numpy array, not jax
+            wide_order = None
     
     # Build the output DataFrame
-    wide_data = {}
+    with _JaxframeTimer("pivot/build_output"):
+        wide_data = {}
     
-    # Add index columns
-    for i, index_col in enumerate(index_columns):
-        wide_data[index_col] = [id_tuple[i] for id_tuple in structure.unique_ids]
+        # Add index columns
+        for i, index_col in enumerate(index_columns):
+            wide_data[index_col] = [id_tuple[i] for id_tuple in structure.unique_ids]
     
-    # Add index_subdata columns using entity_first_row mapping
-    if index_subdata_columns:
-        for col in index_subdata_columns:
-            col_data = df[col]
-            # Check if this column contains traced values
-            if len(col_data) > 0 and _is_jax_traced(col_data[0]):
-                # Use JAX gather for traced values
-                col_array = jnp.stack([col_data[i] for i in range(len(col_data))])
-                wide_data[col] = col_array[structure.entity_first_row]
-            else:
-                # Use Python indexing for non-traced values
-                wide_data[col] = [col_data[i] for i in structure.entity_first_row]
+        # Add index_subdata columns using entity_first_row mapping
+        if index_subdata_columns:
+            for col in index_subdata_columns:
+                col_data = df[col]
+                # Check if this column contains traced values
+                if len(col_data) > 0 and _is_jax_traced(col_data[0]):
+                    # Use JAX gather for traced values
+                    col_array = jnp.stack([col_data[i] for i in range(len(col_data))])
+                    wide_data[col] = col_array[structure.entity_first_row]
+                else:
+                    # Use Python indexing for non-traced values
+                    wide_data[col] = [col_data[i] for i in structure.entity_first_row]
     
-    # Add value, mask, and order columns for each variable slot
-    for col_idx, var_idx in enumerate(structure.unique_vars):
-        value_col_name = f"{var_prefix}${var_idx}$value"
-        mask_col_name = f"{var_prefix}${var_idx}$mask"
-        
-        # Extract column from 2D array
-        wide_data[value_col_name] = wide_values[:, col_idx]
-        # mask_array is always numpy (not traced), convert to list
-        wide_data[mask_col_name] = list(mask_array[:, col_idx])
-        
-        if record_original_order and wide_order is not None:
-            order_col_name = f"{var_prefix}${var_idx}${order_suffix}"
-            wide_data[order_col_name] = wide_order[:, col_idx]
-    
-    return _create_optimized_dataframe(wide_data)
+        # Add value, mask, and order columns for each variable slot
+        for col_idx, var_idx in enumerate(structure.unique_vars):
+            value_col_name = f"{var_prefix}${var_idx}$value"
+            mask_col_name = f"{var_prefix}${var_idx}$mask"
+            
+            # Extract column from 2D array
+            wide_data[value_col_name] = wide_values[:, col_idx]
+            # Keep masks as a NumPy array to avoid list<->array churn.
+            wide_data[mask_col_name] = np.asarray(mask_array[:, col_idx])
+            
+            if record_original_order and wide_order is not None:
+                order_col_name = f"{var_prefix}${var_idx}${order_suffix}"
+                wide_data[order_col_name] = wide_order[:, col_idx]
+
+        return _create_optimized_dataframe(wide_data)
 
 
 def _reorder_dataframe_by_ids(df: DataFrame, index_columns: Union[str, List[str]], reference_ordering: List) -> DataFrame:

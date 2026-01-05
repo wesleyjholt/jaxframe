@@ -588,6 +588,16 @@ class DataFrame:
                     return ColumnType.NUMPY_ARRAY.value, np.array(values)
         
         # Default: convert to list
+        if os.environ.get("JAXFRAME_DEBUG_CHURN", "0") in {"1", "true", "True", "yes", "YES"}:
+            maybe_arraylike = hasattr(values, "shape") or hasattr(values, "dtype") or hasattr(values, "__array__")
+            if maybe_arraylike:
+                mod = getattr(type(values), "__module__", "")
+                typ = type(values).__name__
+                try:
+                    shape = getattr(values, "shape", None)
+                except Exception:
+                    shape = None
+                print(f"[JAXFRAME-CHURN] Converting to list: type={typ} module={mod} shape={shape}")
         return ColumnType.LIST.value, list(values)
     
     def _get_length_fast(self) -> int:
