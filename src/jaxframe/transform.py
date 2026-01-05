@@ -3,6 +3,42 @@ Data transformation utilities for jaxframe DataFrames.
 
 This module provides functions for reshaping and transforming DataFrames,
 including wide-to-long format conversions with mask support.
+
+Profiling Support
+-----------------
+This module includes optional profiling instrumentation to help diagnose
+performance issues during JAX compilation. Profiling is controlled via
+environment variables:
+
+* ``JAXFRAME_PROFILE_TRANSFORM``: Set to "1", "true", "True", "yes", or "YES"
+  to enable profiling output. When enabled, timing information is printed to
+  stdout for major transformation steps.
+
+* ``JAXFRAME_PROFILE_LIMIT``: Maximum number of profiled function calls to
+  output (default: 20). This prevents excessive output during inference when
+  the same function is called many times. Set to a higher value to see more
+  calls, or set to a very large number to see all calls.
+
+Example usage::
+
+    # Enable profiling for first 20 calls
+    export JAXFRAME_PROFILE_TRANSFORM=1
+    python my_script.py
+    
+    # Enable profiling for first 100 calls
+    export JAXFRAME_PROFILE_TRANSFORM=1
+    export JAXFRAME_PROFILE_LIMIT=100
+    python my_script.py
+
+Profiling output includes:
+- Function name and call number
+- Whether values are being traced (JAX compilation)
+- Timing for major subphases (structure computation, value extraction, etc.)
+- Total time for each profiled function call
+
+The profiling is designed to have minimal overhead when disabled, and to
+automatically limit output during tracing and early execution to avoid
+overwhelming the console during inference loops.
 """
 
 from typing import List, Tuple, Any, Union, Optional, Dict
@@ -11,20 +47,77 @@ import numpy as np
 
 
 def _jaxframe_profile_enabled() -> bool:
+    """Check if profiling is enabled via JAXFRAME_PROFILE_TRANSFORM environment variable."""
     import os
-
     return os.environ.get("JAXFRAME_PROFILE_TRANSFORM", "0") in {"1", "true", "True", "yes", "YES"}
 
 
+def _jaxframe_profile_limit() -> int:
+    """Get the profile output limit from environment variable (default: 20)."""
+    import os
+    try:
+        return int(os.environ.get("JAXFRAME_PROFILE_LIMIT", "20"))
+    except ValueError:
+        return 20
+
+
+# Global call counter for profiling
+_profile_call_counters: Dict[str, int] = {}
+
+
+def _should_profile(function_name: str, is_traced: bool = False) -> bool:
+    """
+    Determine if profiling output should be shown for this call.
+    
+    Args:
+        function_name: Name of the function being profiled
+        is_traced: Whether values are currently being traced (JAX compilation)
+        
+    Returns:
+        True if profiling output should be shown, False otherwise
+    """
+    if not _jaxframe_profile_enabled():
+        return False
+    
+    # Initialize counter if needed
+    if function_name not in _profile_call_counters:
+        _profile_call_counters[function_name] = 0
+    
+    # Increment counter
+    _profile_call_counters[function_name] += 1
+    
+    # Get limit
+    limit = _jaxframe_profile_limit()
+    
+    # Check if we're within the limit
+    if _profile_call_counters[function_name] <= limit:
+        return True
+    elif _profile_call_counters[function_name] == limit + 1:
+        # Print a final message that we're stopping
+        print(f"[JAXFRAME-TIMING] {function_name}: profiling limit reached ({limit} calls), suppressing further output")
+        return False
+    else:
+        return False
+
+
 class _JaxframeTimer:
-    def __init__(self, label: str):
+    """Context manager for timing code blocks when profiling is enabled."""
+    
+    def __init__(self, label: str, enabled: bool = None):
+        """
+        Initialize timer.
+        
+        Args:
+            label: Label to display with timing information
+            enabled: Override profiling check (if None, uses _jaxframe_profile_enabled)
+        """
         self.label = label
         self._t0 = None
+        self._enabled = enabled if enabled is not None else _jaxframe_profile_enabled()
 
     def __enter__(self):
-        if _jaxframe_profile_enabled():
+        if self._enabled:
             from time import perf_counter
-
             self._t0 = perf_counter()
         return self
 
@@ -1793,44 +1886,64 @@ def _single_wide_to_long_masked_jax(
     """
     import jax.numpy as jnp
     
+    # Detect if we're being traced by checking first value column
+    is_traced = False
+    for var_idx in sorted(UnpivotStructure(df, index_columns, var_pattern).value_columns.keys())[:1]:
+        col_name = UnpivotStructure(df, index_columns, var_pattern).value_columns[var_idx]
+        if len(df) > 0:
+            first_val = df[col_name][0]
+            is_traced = _is_jax_traced(first_val)
+            break
+    
+    # Check if we should profile this call
+    should_profile = _should_profile("unpivot_jax", is_traced)
+    
+    if should_profile:
+        print(f"[JAXFRAME-TIMING] unpivot_jax: call #{_profile_call_counters.get('unpivot_jax', 0)}, "
+              f"traced={is_traced}, n_rows={len(df)}")
+    
     # Compute the unpivot structure (this is Python, not traced)
-    structure = UnpivotStructure(df, index_columns, var_pattern)
+    with _JaxframeTimer("unpivot/UnpivotStructure", enabled=should_profile):
+        structure = UnpivotStructure(df, index_columns, var_pattern)
     
     # Extract wide values as a 2D JAX array
     # Values are in columns matching the sorted var indices
-    wide_value_cols = []
-    for var_idx in structure.sorted_var_indices:
-        col_name = structure.value_columns[var_idx]
-        col_data = df[col_name]
-        # Stack row values into a column
-        if hasattr(col_data, '__len__') and not isinstance(col_data, str):
-            col_values = jnp.stack([col_data[i] for i in range(len(df))])
-        else:
-            col_values = jnp.array([col_data])
-        wide_value_cols.append(col_values)
-    
-    # Stack columns to form (n_rows, n_cols) array
-    wide_values = jnp.stack(wide_value_cols, axis=1)
+    with _JaxframeTimer("unpivot/extract_wide_values", enabled=should_profile):
+        wide_value_cols = []
+        for var_idx in structure.sorted_var_indices:
+            col_name = structure.value_columns[var_idx]
+            col_data = df[col_name]
+            # Stack row values into a column
+            if hasattr(col_data, '__len__') and not isinstance(col_data, str):
+                col_values = jnp.stack([col_data[i] for i in range(len(df))])
+            else:
+                col_values = jnp.array([col_data])
+            wide_value_cols.append(col_values)
+        
+        # Stack columns to form (n_rows, n_cols) array
+        wide_values = jnp.stack(wide_value_cols, axis=1)
     
     # Apply the unpivot using JAX gather
-    long_values = _apply_unpivot_structure_jax(wide_values, structure)
+    with _JaxframeTimer("unpivot/apply_structure", enabled=should_profile):
+        long_values = _apply_unpivot_structure_jax(wide_values, structure)
     
     # Build the output DataFrame with pre-computed structure
-    long_data = {}
-    
-    # Add index columns (from pre-computed structure, not traced)
-    for index_col in index_columns:
-        long_data[index_col] = structure.long_index_values[index_col]
-    
-    # Add variable column
-    long_data[var_name] = structure.long_var_values
-    
-    # Add value column (JAX array)
-    long_data[value_name] = long_values
-    
-    # Add order column if present
-    if order_value_name is not None and structure.long_order_values is not None:
-        long_data[order_value_name] = structure.long_order_values
+    with _JaxframeTimer("unpivot/build_output", enabled=should_profile):
+        long_data = {}
+        
+        # Add index columns (from pre-computed structure, not traced)
+        for index_col in index_columns:
+            long_data[index_col] = structure.long_index_values[index_col]
+        
+        # Add variable column
+        long_data[var_name] = structure.long_var_values
+        
+        # Add value column (JAX array)
+        long_data[value_name] = long_values
+        
+        # Add order column if present
+        if order_value_name is not None and structure.long_order_values is not None:
+            long_data[order_value_name] = structure.long_order_values
     
     return _create_optimized_dataframe(long_data)
 
@@ -2076,9 +2189,20 @@ def _single_long_to_wide_masked_jax(
     """
     import jax.numpy as jnp
     
+    # Detect if we're being traced
+    col_data = df[value_column]
+    is_traced = len(df) > 0 and _is_jax_traced(col_data[0] if hasattr(col_data, '__getitem__') else col_data)
+    
+    # Check if we should profile this call
+    should_profile = _should_profile("pivot_jax", is_traced)
+    
+    if should_profile:
+        print(f"[JAXFRAME-TIMING] pivot_jax: call #{_profile_call_counters.get('pivot_jax', 0)}, "
+              f"traced={is_traced}, n_rows={len(df)}, sort_within_id={sort_within_id}")
+    
     # Compute the pivot structure (this is Python, not traced)
     # Use JAX sorting when sort_within_id is True
-    with _JaxframeTimer("pivot/PivotStructure"):
+    with _JaxframeTimer("pivot/PivotStructure", enabled=should_profile):
         structure = PivotStructure(
             df=df,
             index_columns=index_columns,
@@ -2089,8 +2213,7 @@ def _single_long_to_wide_masked_jax(
         )
     
     # Extract values as a JAX array (this is the traced part)
-    with _JaxframeTimer("pivot/extract_values"):
-        col_data = df[value_column]
+    with _JaxframeTimer("pivot/extract_values", enabled=should_profile):
         if hasattr(col_data, "shape") and getattr(col_data, "shape")[0] == len(df):
             values = jnp.asarray(col_data)
         else:
@@ -2101,7 +2224,7 @@ def _single_long_to_wide_masked_jax(
     # Pass fill_type directly - the apply functions handle local_max/global_max
     record_original_order = sort_within_id and order_suffix is not None
     
-    with _JaxframeTimer("pivot/apply_structure"):
+    with _JaxframeTimer("pivot/apply_structure", enabled=should_profile):
         if structure.requires_jax_sort:
             # Use JAX-based sorting
             wide_values, mask_array, wide_order = _apply_pivot_structure_jax_sorted(
@@ -2115,7 +2238,7 @@ def _single_long_to_wide_masked_jax(
             wide_order = None
     
     # Build the output DataFrame
-    with _JaxframeTimer("pivot/build_output"):
+    with _JaxframeTimer("pivot/build_output", enabled=should_profile):
         wide_data = {}
     
         # Add index columns
@@ -2206,71 +2329,91 @@ def wide_df_to_masked_array(
     
     import re
     
+    # Detect if we're being traced
+    is_traced = False
+    if len(df) > 0 and len(df.columns) > 0:
+        # Check first non-index column
+        for col in df.columns:
+            if col not in (index_columns if isinstance(index_columns, list) else [index_columns]):
+                if len(df) > 0:
+                    first_val = df[col][0]
+                    is_traced = _is_jax_traced(first_val)
+                    break
+    
+    # Check if we should profile this call
+    should_profile = _should_profile("wide_to_masked_array", is_traced)
+    
+    if should_profile:
+        print(f"[JAXFRAME-TIMING] wide_to_masked_array: call #{_profile_call_counters.get('wide_to_masked_array', 0)}, "
+              f"traced={is_traced}, n_rows={len(df)}")
+    
     # Ensure index_columns is a list
     if isinstance(index_columns, str):
         index_columns = [index_columns]
     
     # Find value and mask columns
-    value_columns = []
-    mask_columns = []
-    order_columns = []
-    var_indices = []
-    
-    pattern = re.compile(var_pattern)
-    
-    for col in df.columns:
-        if col in index_columns:
-            continue
-            
-        match = pattern.match(col)
-        if match:
-            var_name, var_index = match.groups()
-            var_index = int(var_index)
-            value_columns.append(col)
-            var_indices.append(var_index)
-            
-            # Look for corresponding mask column
-            mask_col = f"{var_name}${var_index}$mask"
-            if mask_col in df.columns:
-                mask_columns.append(mask_col)
-            else:
-                mask_columns.append(None)  # No mask column found
-            
-            # Look for corresponding order column
-            order_col = f"{var_name}${var_index}$order"
-            if order_col in df.columns:
-                order_columns.append(order_col)
-            else:
-                order_columns.append(None)
-    
-    if not value_columns:
-        raise ValueError(f"No value columns found matching pattern: {var_pattern}")
-    
-    # Sort by variable index if requested
-    if sort_by_var_index:
-        sorted_data = sorted(zip(var_indices, value_columns, mask_columns, order_columns))
-        var_indices, value_columns, mask_columns, order_columns = zip(*sorted_data)
+    with _JaxframeTimer("wide_to_masked_array/find_columns", enabled=should_profile):
+        value_columns = []
+        mask_columns = []
+        order_columns = []
+        var_indices = []
+        
+        pattern = re.compile(var_pattern)
+        
+        for col in df.columns:
+            if col in index_columns:
+                continue
+                
+            match = pattern.match(col)
+            if match:
+                var_name, var_index = match.groups()
+                var_index = int(var_index)
+                value_columns.append(col)
+                var_indices.append(var_index)
+                
+                # Look for corresponding mask column
+                mask_col = f"{var_name}${var_index}$mask"
+                if mask_col in df.columns:
+                    mask_columns.append(mask_col)
+                else:
+                    mask_columns.append(None)  # No mask column found
+                
+                # Look for corresponding order column
+                order_col = f"{var_name}${var_index}$order"
+                if order_col in df.columns:
+                    order_columns.append(order_col)
+                else:
+                    order_columns.append(None)
+        
+        if not value_columns:
+            raise ValueError(f"No value columns found matching pattern: {var_pattern}")
+        
+        # Sort by variable index if requested
+        if sort_by_var_index:
+            sorted_data = sorted(zip(var_indices, value_columns, mask_columns, order_columns))
+            var_indices, value_columns, mask_columns, order_columns = zip(*sorted_data)
     
     # Extract values and masks
-    n_rows = len(df)
-    n_vars = len(value_columns)
-    
-    values = jnp.zeros((n_rows, n_vars))
-    masks = np.ones((n_rows, n_vars), dtype=bool)  # Use numpy for masks to avoid traced boolean errors
-    
-    for i, (value_col, mask_col) in enumerate(zip(value_columns, mask_columns)):
-        # Get values
-        col_values = df[value_col]
-        if hasattr(col_values, 'copy'):
-            col_values = col_values.copy()
-        values = values.at[:, i].set(jnp.array(col_values))
+    with _JaxframeTimer("wide_to_masked_array/extract_values", enabled=should_profile):
+        n_rows = len(df)
+        n_vars = len(value_columns)
         
-        # Get masks
-        if mask_col is not None:
-            col_masks = df[mask_col]
-            if hasattr(col_masks, 'copy'):
-                col_masks = col_masks.copy()
-            masks[:, i] = np.array(col_masks)  # Use numpy assignment for masks
+        values = jnp.zeros((n_rows, n_vars))
+        masks = np.ones((n_rows, n_vars), dtype=bool)  # Use numpy for masks to avoid traced boolean errors
+        
+        for i, (value_col, mask_col) in enumerate(zip(value_columns, mask_columns)):
+            # Get values
+            col_values = df[value_col]
+            if hasattr(col_values, 'copy'):
+                col_values = col_values.copy()
+            values = values.at[:, i].set(jnp.array(col_values))
+            
+            # Get masks
+            if mask_col is not None:
+                col_masks = df[mask_col]
+                if hasattr(col_masks, 'copy'):
+                    col_masks = col_masks.copy()
+                masks[:, i] = np.array(col_masks)  # Use numpy assignment for masks
     
     # Use the original wide DataFrame as skeleton (it contains all needed columns including index and order)
     # The MaskedArray now stores wide_skeleton_df and index_columns (no separate index_df)
